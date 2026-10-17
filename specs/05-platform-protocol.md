@@ -158,7 +158,8 @@ session's last settled complex round in `SessionInfo.lastSettledRound`
 (round id, mode, win, multiplier, type, balance after the credit, final state,
 math version, request key). A retried CLOSE with the same token is answered
 from that record - close ops rebuilt from the final state - with no financial
-operation; any other CLOSE is `NO_ROUND_OPEN`. Like `reason`, `requestKey` is
+operation; any other CLOSE is `NO_ROUND_OPEN`. The recovered response carries no `platformMaxWin` flag (the wallet
+record does not keep it); the win, multiplier and type are the recorded ones. Like `reason`, `requestKey` is
 observational: wallets MUST leave both out of their idempotency fingerprint,
 so an autoclose repeating a committed client CLOSE replays instead of
 conflicting. The autoclose backstop above is
