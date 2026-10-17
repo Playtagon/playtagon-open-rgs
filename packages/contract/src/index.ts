@@ -537,6 +537,10 @@ export interface WalletOpenRound extends OpenRoundResume {
   state?: RoundState;
   /** OpenComplex.mathVersion. A round is only adopted by the same math version. */
   mathVersion?: string;
+  /** OpenComplex.promoId. A wallet MUST return it for a promo-funded round:
+   *  a free round is priced at its bet (no stake fold), so without it the
+   *  round would be valued like a paid one. */
+  promoId?: string;
 }
 
 export interface SettleSimple {

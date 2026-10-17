@@ -646,12 +646,16 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
   /**
    * A complex round the wallet reports open but this process never saw (it was
    * opened before a restart or on another pod). Adopted only when it can be
-   * settled faithfully here: a known complex mode, the persisted state, and the
-   * same math version that produced it. The cost is recomputed exactly as at
-   * open (`bet x stakeMultiplier`, priceMultiplier is already in `bet`). Ops come
-   * from the wallet or, when it has none (ops never cross to the wallet), from
-   * the math's pure `resume` hook. Otherwise nothing is adopted and the round is
-   * left to the wallet's autoclose backstop (Spec 05).
+   * settled faithfully here: a known complex mode, the persisted state, the same
+   * math version that produced it, and a state known to be CURRENT - either the
+   * outcome was fixed at open (the math's resume says the round only awaits the
+   * end-round action), or every step was checkpointed to the wallet (mandatory
+   * audit + updateComplex). A best-effort checkpoint may predate the last step,
+   * and replaying from it would let the round be played again. The cost is
+   * recomputed exactly as computeBet does: a promo-funded round at its bet, a
+   * paid one at `bet x stakeMultiplier`. Ops come from the wallet or the math's
+   * pure `resume` hook. Otherwise nothing is adopted and the round is left to
+   * the wallet's autoclose backstop (Spec 05).
    */
   async function adoptWalletOpenRound(sessionId: string, r: WalletOpenRound | undefined): Promise<OpenRound | undefined> {
     if (!r) return undefined;
@@ -669,15 +673,22 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     if (!Number.isSafeInteger(r.bet) || r.bet < 0) return skip("invalid bet");
     let ops = r.ops ?? [];
     let awaiting = r.awaiting;
-    if (ops.length === 0 && typeof mode.math.resume === "function") {
+    let fixedAtOpen = false;
+    if (typeof mode.math.resume === "function") {
       try {
         const view = await Promise.resolve(mode.math.resume(r.state));
-        ops = view.ops;
-        awaiting = view.awaiting ?? awaiting;
+        // Trust the MATH (not the wallet) about whether the outcome is already fixed.
+        fixedAtOpen = isAwaitingEndRound(view.awaiting?.type);
+        if (ops.length === 0) {
+          ops = view.ops;
+          awaiting = view.awaiting ?? awaiting;
+        }
       } catch (e) {
         return skip(`math could not rebuild the round: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
+    const checkpointed = auditMode === "mandatory" && typeof platform.updateComplex === "function";
+    if (!fixedAtOpen && !checkpointed) return skip("the wallet's state may predate the last step (best-effort checkpoints)");
     log.info("Open round adopted from the wallet", {
       "event.category": "orchestrator", "event.action": "resume_adopted",
       "session.id": sessionId, "round.id": r.roundId, "round.mode": r.modeId, "round.ops": ops.length,
@@ -686,8 +697,10 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       roundId: r.roundId,
       modeId: r.modeId,
       bet: r.bet,
-      effectiveCost: r.bet * mode.stakeMultiplier,
+      // as computeBet: promo-overridden free rounds skip the stake fold
+      effectiveCost: r.promoId ? r.bet : r.bet * mode.stakeMultiplier,
       state: r.state,
+      ...(r.promoId ? { promoId: r.promoId } : {}),
       ...(awaiting ? { awaiting } : {}),
       actionLog: [...(r.actionLog ?? [])],
       opsLog: [...ops],

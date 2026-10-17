@@ -130,7 +130,14 @@ checkpoint) and `mathVersion` (from `OpenComplex.mathVersion`). On a fresh
 INIT the orchestrator adopts the round only when it can settle it faithfully:
 the mode exists and is complex, `state` is present and `mathVersion` equals the
 loaded math's version. The cost is recomputed as at open
-(`bet x stakeMultiplier`). Empty `ops` are rebuilt by the math's optional pure
+(`bet x stakeMultiplier`, or the bet alone for a promo-funded round, so a
+wallet MUST return `promoId` for such a round). The state must also be known
+to be current: the round is adopted only when its outcome was fixed at open
+(the math's `resume` reports it awaits just the end-round action, as
+`withDeferredClose` does) or every step was checkpointed (`auditMode:
+"mandatory"` with `updateComplex`); a best-effort checkpoint may predate the
+last step and replaying from it would let the round be played again. Empty
+`ops` are rebuilt by the math's optional pure
 `ComplexMath.resume(state)` hook (`withDeferredClose` implements it from the
 parked outcome), so the resumed client renders the same spin. `state` is never
 forwarded to the client. A round that is not adopted is logged
