@@ -565,7 +565,6 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       };
       const adopted = await adoptWalletOpenRound(req.sid, info.openRound);
       if (adopted) s.openRound = adopted;
-      else if (info.lastSettledRound) s.lastSettledRound = info.lastSettledRound;
 
       // put() can evict idle overflow. Those sessions are gone from the cache,
       // so their request-cache entries are unreachable state - drop them with
@@ -1025,12 +1024,13 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
 
   async function closeRound(req: ClientRequestCloseRound, conn: ConnectionMeta): Promise<ClientResponseCloseRound> {
     const s = sessionOrThrow(req.sid ?? conn.sessionId);
+    // A retried CLOSE is matched to the round it closed BEFORE anything is done
+    // with the current round: after a restart a newer round may be open, and the
+    // old token must not settle it.
+    const recovered = await recoverSettledClose(s, req);
+    if (recovered) return recovered;
     const open = s.openRound;
-    if (!open) {
-      const recovered = await recoverSettledClose(s, req);
-      if (recovered) return recovered;
-      throw new RGSError("NO_ROUND_OPEN", "No round in progress");
-    }
+    if (!open) throw new RGSError("NO_ROUND_OPEN", "No round in progress");
 
     const mode = modeOrThrow(open.modeId);
     const math = mode.math as ComplexMath;
@@ -1121,23 +1121,34 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
 
   /**
    * A client retrying a CLOSE whose response was lost - and the process that
-   * settled it died, taking its response cache along. The wallet reported the
-   * settlement at INIT (SessionInfo.lastSettledRound) together with the token
-   * of the request that made it: the SAME token gets the original result back,
-   * rebuilt from the persisted final state, with no financial operation. Any
-   * other close stays NO_ROUND_OPEN.
+   * settled it died, taking its response cache along. The wallet keeps which
+   * round each client close token was accepted for (findSettledClose): the
+   * SAME token gets that round's original result back, rebuilt from its
+   * persisted final state, with no financial operation - whatever round is
+   * open now. A token the wallet does not know proceeds as a normal close.
    */
   async function recoverSettledClose(s: sessions.LocalSession, req: ClientRequestCloseRound): Promise<ClientResponseCloseRound | undefined> {
-    const done = s.lastSettledRound;
-    if (!done || !req.idempotencyKey || done.requestKey !== closeRequestKey(s.sessionId, req.idempotencyKey)) return undefined;
+    if (!req.idempotencyKey || typeof platform.findSettledClose !== "function") return undefined;
+    let done;
+    try {
+      done = await platform.findSettledClose(s.sessionId, closeRequestKey(s.sessionId, req.idempotencyKey));
+    } catch (e) {
+      throw translate(e, "CLOSE_FAILED");
+    }
+    if (!done) return undefined;
+    // The token IS known: from here on it must never fall through to a normal
+    // close (that would settle whatever round is open now with an old token).
+    const unrecoverable = (why: string): never => {
+      throw new RGSError("CLOSE_FAILED", `That close was already settled (round ${done.roundId}) but its result cannot be rebuilt here: ${why}`);
+    };
     const mode = manifest.modes[done.modeId];
-    if (!mode || mode.math.kind !== "complex" || done.finalState === undefined) return undefined;
-    if (!done.mathVersion || done.mathVersion !== mode.math.version) return undefined;
+    if (!mode || mode.math.kind !== "complex" || done.finalState === undefined) return unrecoverable("unknown mode or no final state");
+    if (!done.mathVersion || done.mathVersion !== mode.math.version) return unrecoverable("different math version");
     let close;
     try {
       close = await Promise.resolve((mode.math as ComplexMath).close(done.finalState));
-    } catch {
-      return undefined;
+    } catch (e) {
+      return unrecoverable(e instanceof Error ? e.message : String(e));
     }
     // the recorded settlement is authoritative; a capped round carries its cap op
     const ops = done.type === "max_win_reached" ? applyMaxWinCapClose(close, 0, done.multiplier).ops : close.ops;

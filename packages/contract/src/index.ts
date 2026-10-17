@@ -427,10 +427,6 @@ export interface SessionInfo {
    *  "Open-round persistence & resume"). With `state` (and a matching
    *  `mathVersion`) the orchestrator adopts the round on any process. */
   openRound?: WalletOpenRound;
-  /** The session's most recently SETTLED complex round, if the wallet keeps it.
-   *  Lets a process that never saw the close answer a client retrying a CLOSE
-   *  whose response was lost (no second financial operation). */
-  lastSettledRound?: WalletSettledRound;
   /**
    * Platform data that belongs to the CLIENT, forwarded verbatim.
    *
@@ -549,7 +545,7 @@ export interface WalletOpenRound extends OpenRoundResume {
   terms?: string;
 }
 
-/** A settled complex round as the wallet recorded it (see SessionInfo.lastSettledRound). */
+/** A settled complex round as the wallet recorded it (see PlatformAdapter.findSettledClose). */
 export interface WalletSettledRound {
   roundId: string;
   modeId: string;
@@ -561,8 +557,6 @@ export interface WalletSettledRound {
   /** CloseComplex.finalState - the math rebuilds the close ops from it. */
   finalState?: RoundState;
   mathVersion?: string;
-  /** CloseComplex.requestKey of the close that settled it. */
-  requestKey?: string;
 }
 
 export interface SettleSimple {
@@ -645,8 +639,10 @@ export interface CloseComplex {
   reason?: string;
   /** Opaque token of the CLIENT request that closed the round (derived from
    *  the client's idempotency key). Observational: wallets must leave it, like
-   *  `reason`, out of their idempotency fingerprint. Returned in
-   *  WalletSettledRound.requestKey. */
+   *  `reason`, out of their idempotency fingerprint. A wallet implementing
+   *  `findSettledClose` durably maps it to the round this close settled -
+   *  whether this call credited it or replayed an earlier settlement of it
+   *  (e.g. an autoclose that got there first). */
   requestKey?: string;
 }
 
@@ -771,6 +767,11 @@ export interface PlatformAdapter {
   updateComplex?(req: UpdateComplex): Promise<void>;
   /** Close a complex round (credit win). */
   closeComplex(req: CloseComplex): Promise<RoundReceipt>;
+  /** Optional: the settled round a client CLOSE with this `requestKey` was
+   *  accepted for (see CloseComplex.requestKey). Lets a process that never saw
+   *  that close answer a client retrying it after a lost response - even if a
+   *  newer round is open by then - with no financial operation. */
+  findSettledClose?(sessionId: string, requestKey: string): Promise<WalletSettledRound | undefined>;
 
   /** Reverse an already-settled round (chargeback / reconciliation). Optional  -
    *  implement only if your upstream supports reversal. MUST undo money AND

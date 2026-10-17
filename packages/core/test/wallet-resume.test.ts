@@ -12,6 +12,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createOrchestrator } from "../src/index.js";
 import { withDeferredClose } from "../src/deferred-close.js";
 import { remove as forgetSession } from "../src/session.js";
+import { deriveIdempotencyKey } from "../src/idempotency.js";
 import {
   defineGame,
   type PlatformAdapter, type SessionInfo, type SettleSimple, type OpenComplex,
@@ -27,7 +28,9 @@ class DurableWallet implements PlatformAdapter {
   balance = 100_000;
   open = new Map<string, Stored>();
   credits: number[] = [];
+  /** round id → settlement; `${sessionId}|${requestKey}` → round id (durable, every accepted close). */
   settled = new Map<string, WalletSettledRound>();
+  requestRounds = new Map<string, string>();
   closeKeys = new Set<string>();
   private seq = 0;
   /** Test knobs for adapters that persist less than Spec 05 asks. */
@@ -57,11 +60,9 @@ class DurableWallet implements PlatformAdapter {
       ...(o.promoId ? { promoId: o.promoId } : {}),
       ...(o.terms ? { terms: o.terms } : {}),
     }
-    const last = this.settled.get(sessionId);
     return {
       sessionId, currency: "USD", currencyDecimals: 2, balance: this.balance, allowedBets: [100], defaultBetIndex: 0,
       ...(openRound ? { openRound } : {}),
-      ...(last ? { lastSettledRound: last } : {}),
       ...(this.promo && this.promo.remaining > 0 ? { promo: { ...this.promo } } : {}),
     };
   }
@@ -80,20 +81,28 @@ class DurableWallet implements PlatformAdapter {
     return { roundId, balance: this.balance };
   }
   async closeComplex(req: CloseComplex): Promise<RoundReceipt> {
-    if (req.idempotencyKey && this.closeKeys.has(req.idempotencyKey)) return { roundId: req.roundId, balance: this.balance };
+    if (req.idempotencyKey && this.closeKeys.has(req.idempotencyKey)) {
+      // a replay of an earlier settlement (e.g. an autoclose): still map the client token
+      if (req.requestKey) this.requestRounds.set(`${req.sessionId}|${req.requestKey}`, req.roundId);
+      return { roundId: req.roundId, balance: this.balance };
+    }
     const o = this.open.get(req.sessionId);
     if (!o || o.roundId !== req.roundId) throw new Error("RoundNotOpen");
     this.balance += req.win;
     this.credits.push(req.win);
     if (req.idempotencyKey) this.closeKeys.add(req.idempotencyKey);
     this.open.delete(req.sessionId);
-    this.settled.set(req.sessionId, {
+    this.settled.set(req.roundId, {
       roundId: req.roundId, modeId: o.modeId ?? "", win: req.win, multiplier: req.multiplier, type: req.type,
       balance: this.balance, finalState: req.finalState,
       ...(req.mathVersion ? { mathVersion: req.mathVersion } : {}),
-      ...(req.requestKey ? { requestKey: req.requestKey } : {}),
     });
+    if (req.requestKey) this.requestRounds.set(`${req.sessionId}|${req.requestKey}`, req.roundId);
     return { roundId: req.roundId, balance: this.balance };
+  }
+  async findSettledClose(sessionId: string, requestKey: string): Promise<WalletSettledRound | undefined> {
+    const roundId = this.requestRounds.get(`${sessionId}|${requestKey}`);
+    return roundId ? this.settled.get(roundId) : undefined;
   }
   onEvent(_h: (e: PlatformEvent) => void) {}
 }
@@ -122,7 +131,7 @@ function runtime(wallet: DurableWallet, m: ComplexMath, auditMode: "best-effort"
 }
 
 // The session cache is module-level and shared with other suites: never leave ours behind.
-afterEach(() => { for (let i = 1; i <= 15; i++) forgetSession(`wr-s${i}`); });
+afterEach(() => { for (let i = 1; i <= 20; i++) forgetSession(`wr-s${i}`); });
 
 /** A pick game: open → one pick step → terminal. The state after the step is what pays. */
 function pickGame(): ComplexMath {
@@ -335,5 +344,59 @@ describe("adoption safety (security review)", () => {
     expect(wallet.credits).toEqual([first.win]);
     // another token is not a retry of that close
     await expect(p2.orch.closeRound({ idempotencyKey: "close-2" }, p2.conn)).rejects.toThrow(/No round in progress/);
+  });
+
+  // --- Codex review 4 -----------------------------------------------------
+
+  test("a retried CLOSE of an old round answers for THAT round, even when a new round is open", async () => {
+    const wallet = new DurableWallet();
+    const p1 = runtime(wallet, withDeferredClose(simple()));
+    await p1.orch.init({ sid: "wr-s16" }, p1.conn);
+    await p1.orch.openRound({ mode: "buy" }, p1.conn);
+    const a = await p1.orch.closeRound({ idempotencyKey: "close-A" }, p1.conn); // response lost
+    forgetSession("wr-s16");
+    const p2 = runtime(wallet, withDeferredClose(simple()));
+    await p2.orch.init({ sid: "wr-s16" }, p2.conn);
+    const b = await p2.orch.openRound({ mode: "buy" }, p2.conn);
+    const retried = await p2.orch.closeRound({ idempotencyKey: "close-A" }, p2.conn);
+    expect(retried).toEqual(a); // round A's result, not a settlement of B
+    expect(wallet.open.get("wr-s16")?.roundId).toBe(b.roundId); // B is still open
+    expect(wallet.credits).toEqual([a.win]);
+  });
+
+  test("a client CLOSE that only replays an autoclose settlement is still recoverable after a restart", async () => {
+    const wallet = new DurableWallet();
+    const p1 = runtime(wallet, withDeferredClose(simple()));
+    await p1.orch.init({ sid: "wr-s17" }, p1.conn);
+    const opened = await p1.orch.openRound({ mode: "buy" }, p1.conn);
+    // another runtime serving the same session autocloses first: same per-round key, no client token
+    await wallet.closeComplex({
+      sessionId: "wr-s17", roundId: opened.roundId, finalState: wallet.open.get("wr-s17")!.state,
+      win: 7 * 100 * 50, multiplier: 7, type: "win", reason: "idle", mathVersion: "1.0.0",
+      idempotencyKey: deriveIdempotencyKey("wr-s17", opened.roundId, "close"),
+    });
+    // this runtime still holds the round: the client's CLOSE replays that settlement
+    const first = await p1.orch.closeRound({ idempotencyKey: "close-C" }, p1.conn); // response lost
+    expect(wallet.credits).toEqual([7 * 100 * 50]);
+    forgetSession("wr-s17"); // and the runtime dies
+    const p2 = runtime(wallet, withDeferredClose(simple()));
+    await p2.orch.init({ sid: "wr-s17" }, p2.conn);
+    expect(await p2.orch.closeRound({ idempotencyKey: "close-C" }, p2.conn)).toEqual(first);
+    expect(wallet.credits).toEqual([7 * 100 * 50]);
+  });
+
+  test("a known CLOSE token whose result cannot be rebuilt is an error, never a close of the open round", async () => {
+    const wallet = new DurableWallet();
+    const p1 = runtime(wallet, withDeferredClose(simple("1.0.0")));
+    await p1.orch.init({ sid: "wr-s18" }, p1.conn);
+    await p1.orch.openRound({ mode: "buy" }, p1.conn);
+    const a = await p1.orch.closeRound({ idempotencyKey: "close-A" }, p1.conn);
+    forgetSession("wr-s18");
+    const p2 = runtime(wallet, withDeferredClose(simple("2.0.0"))); // a new math version is deployed
+    await p2.orch.init({ sid: "wr-s18" }, p2.conn);
+    const b = await p2.orch.openRound({ mode: "buy" }, p2.conn);
+    await expect(p2.orch.closeRound({ idempotencyKey: "close-A" }, p2.conn)).rejects.toThrow(/already settled/);
+    expect(wallet.open.get("wr-s18")?.roundId).toBe(b.roundId);
+    expect(wallet.credits).toEqual([a.win]);
   });
 });

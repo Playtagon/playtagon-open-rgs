@@ -153,16 +153,20 @@ forwarded to the client. A round that is not adopted is logged
 **Lost CLOSE response.** A client whose CLOSE response was lost retries with
 the same idempotency token. If the process that settled it died, its response
 cache died too. The orchestrator therefore sends `CloseComplex.requestKey` (a
-token derived from the client's), and a wallet that keeps it returns the
-session's last settled complex round in `SessionInfo.lastSettledRound`
-(round id, mode, win, multiplier, type, balance after the credit, final state,
-math version, request key). A retried CLOSE with the same token is answered
-from that record - close ops rebuilt from the final state - with no financial
-operation; any other CLOSE is `NO_ROUND_OPEN`. The recovered response carries no `platformMaxWin` flag (the wallet
-record does not keep it); the win, multiplier and type are the recorded ones. Like `reason`, `requestKey` is
-observational: wallets MUST leave both out of their idempotency fingerprint,
-so an autoclose repeating a committed client CLOSE replays instead of
-conflicting. The autoclose backstop above is
+token derived from the client's), and a wallet implementing the optional
+`PlatformAdapter.findSettledClose(sessionId, requestKey)` durably maps it to
+the round that close was ACCEPTED for - whether it credited the round or
+replayed an earlier settlement of it (an autoclose that got there first). A
+CLOSE carrying a token is looked up FIRST, before anything is done with the
+current round: a known token returns that round's original result (close ops
+rebuilt from its final state, recorded win, multiplier, type and balance) with
+no financial operation, even if a newer round is open by then; if the result
+cannot be rebuilt (another math version) the request fails and the open round
+is left alone. An unknown token proceeds as a normal close. The recovered
+response carries no `platformMaxWin` flag (the wallet record does not keep it).
+Like `reason`, `requestKey` is observational: wallets MUST leave both out of
+their idempotency fingerprint, so an autoclose repeating a committed client
+CLOSE replays instead of conflicting. The autoclose backstop above is
 **unchanged**, resume rescues the player who returns; the backstop
 settles the round of the player who never does.
 
