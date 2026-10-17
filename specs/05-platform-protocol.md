@@ -121,7 +121,20 @@ render-degraded; same-pod resume keeps full fidelity.
 
 Until v1.7, adapters MAY omit all of this; the orchestrator treats an
 absent `openRound` as "nothing to resume" and
-`manifest.recovery.onRestart` applies. The autoclose backstop above is
+`manifest.recovery.onRestart` applies.
+
+**Orchestrator side (implemented).** `OpenComplex.modeId` tells the wallet
+which mode to persist. `SessionInfo.openRound` is a `WalletOpenRound`: the
+client-facing `OpenRoundResume` plus `state` (the initial state or last
+checkpoint) and `mathVersion` (from `OpenComplex.mathVersion`). On a fresh
+INIT the orchestrator adopts the round only when it can settle it faithfully:
+the mode exists and is complex, `state` is present and `mathVersion` equals the
+loaded math's version. The cost is recomputed as at open
+(`bet x stakeMultiplier`). Empty `ops` are rebuilt by the math's optional pure
+`ComplexMath.resume(state)` hook (`withDeferredClose` implements it from the
+parked outcome), so the resumed client renders the same spin. `state` is never
+forwarded to the client. A round that is not adopted is logged
+(`resume_not_adopted`) and left to the autoclose backstop. The autoclose backstop above is
 **unchanged**, resume rescues the player who returns; the backstop
 settles the round of the player who never does.
 

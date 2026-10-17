@@ -46,7 +46,8 @@ import { isAwaitingEndRound } from "./deferred-close.js";
  *  every transport and client says the same thing. */
 export const UNFINISHED_ROUND_MESSAGE = "Unfinished round \u2014 watching replay";
 import type { RgsMetrics } from "./metrics-rgs.js";
-import type { IdempotencyConfig, ConcurrencyPolicy } from "@open-rgs/contract";
+import type { IdempotencyConfig, ConcurrencyPolicy, WalletOpenRound } from "@open-rgs/contract";
+import type { OpenRound } from "./session.js";
 
 export interface OrchestratorConfig {
   manifest: GameManifest;
@@ -562,6 +563,9 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         ...(info.clientData !== undefined ? { clientData: info.clientData } : {}),
         createdAt: Date.now(),
       };
+      const adopted = await adoptWalletOpenRound(req.sid, info.openRound);
+      if (adopted) s.openRound = adopted;
+
       // put() can evict idle overflow. Those sessions are gone from the cache,
       // so their request-cache entries are unreachable state - drop them with
       // the session rather than leaving them to age out on the TTL.
@@ -635,6 +639,60 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       "session.has_resume": Boolean(s.openRound),
     });
     return resp;
+  }
+
+  // --- WALLET-DRIVEN RESUME (ADR-007) ---------------------------------------
+
+  /**
+   * A complex round the wallet reports open but this process never saw (it was
+   * opened before a restart or on another pod). Adopted only when it can be
+   * settled faithfully here: a known complex mode, the persisted state, and the
+   * same math version that produced it. The cost is recomputed exactly as at
+   * open (`bet x stakeMultiplier`, priceMultiplier is already in `bet`). Ops come
+   * from the wallet or, when it has none (ops never cross to the wallet), from
+   * the math's pure `resume` hook. Otherwise nothing is adopted and the round is
+   * left to the wallet's autoclose backstop (Spec 05).
+   */
+  async function adoptWalletOpenRound(sessionId: string, r: WalletOpenRound | undefined): Promise<OpenRound | undefined> {
+    if (!r) return undefined;
+    const skip = (reason: string): undefined => {
+      log.warn("Wallet reports an open round this process cannot adopt", {
+        "event.category": "orchestrator", "event.action": "resume_not_adopted",
+        "session.id": sessionId, "round.id": r.roundId, "round.mode": r.modeId, reason,
+      });
+      return undefined;
+    };
+    const mode = manifest.modes[r.modeId];
+    if (!mode || mode.math.kind !== "complex") return skip("unknown or non-complex mode");
+    if (r.state === undefined) return skip("wallet did not persist the round state");
+    if (!r.mathVersion || r.mathVersion !== mode.math.version) return skip("math version differs from the one that opened the round");
+    if (!Number.isSafeInteger(r.bet) || r.bet < 0) return skip("invalid bet");
+    let ops = r.ops ?? [];
+    let awaiting = r.awaiting;
+    if (ops.length === 0 && typeof mode.math.resume === "function") {
+      try {
+        const view = await Promise.resolve(mode.math.resume(r.state));
+        ops = view.ops;
+        awaiting = view.awaiting ?? awaiting;
+      } catch (e) {
+        return skip(`math could not rebuild the round: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    log.info("Open round adopted from the wallet", {
+      "event.category": "orchestrator", "event.action": "resume_adopted",
+      "session.id": sessionId, "round.id": r.roundId, "round.mode": r.modeId, "round.ops": ops.length,
+    });
+    return {
+      roundId: r.roundId,
+      modeId: r.modeId,
+      bet: r.bet,
+      effectiveCost: r.bet * mode.stakeMultiplier,
+      state: r.state,
+      ...(awaiting ? { awaiting } : {}),
+      actionLog: [...(r.actionLog ?? [])],
+      opsLog: [...ops],
+      openedAt: r.openedAt ?? Date.now(),
+    };
   }
 
   // --- SIMPLE SPIN --------------------------------------------------------
@@ -824,6 +882,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         bet: betInfo.bet,
         betIndex: betInfo.betIndex,
         priceMultiplier: betInfo.priceMultiplier * mode.stakeMultiplier,
+        modeId: requestedMode,
         initialState: open.state,
         ...(mode.math.version ? { mathVersion: mode.math.version } : {}),
         idempotencyKey: initiatingIdemKey(s.sessionId, "open", req.idempotencyKey),

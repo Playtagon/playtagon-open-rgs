@@ -281,6 +281,17 @@ export interface ComplexMath {
 
   /** Optional autoclose resolver: produce a close outcome from current state. */
   autoclose?(state: RoundState): CloseOutcome | Promise<CloseOutcome>;
+
+  /** Optional (ADR-007): rebuild the render ops and the `awaiting` hint of an
+   *  open round from its state, for a resume on a process that did not open
+   *  it (ops never cross to the wallet). Pure: no RNG, no side effects. */
+  resume?(state: RoundState): ResumeView | Promise<ResumeView>;
+}
+
+/** What a math can rebuild from an open round's state (see ComplexMath.resume). */
+export interface ResumeView {
+  ops: Op[];
+  awaiting?: AwaitingHint;
 }
 
 export type MathModule = SimpleMath | ComplexMath;
@@ -412,8 +423,10 @@ export interface SessionInfo {
   defaultBetIndex: number;
   /** Active promo free-rounds pool, if any. */
   promo?: PromoFreeRounds;
-  /** Open round to resume on reconnect, if any. */
-  openRound?: OpenRoundResume;
+  /** Open round to resume on reconnect, if any (ADR-007, Spec 05
+   *  "Open-round persistence & resume"). With `state` (and a matching
+   *  `mathVersion`) the orchestrator adopts the round on any process. */
+  openRound?: WalletOpenRound;
   /**
    * Platform data that belongs to the CLIENT, forwarded verbatim.
    *
@@ -514,6 +527,18 @@ export interface OpenRoundResume {
   };
 }
 
+/** The open round as the WALLET knows it (Spec 05 §"Open-round persistence &
+ *  resume"). It extends the client-facing resume with what only the server may
+ *  hold: the round's last state checkpoint and the math version that produced
+ *  it. The orchestrator never forwards `state` to a client. */
+export interface WalletOpenRound extends OpenRoundResume {
+  /** Initial state (OpenComplex.initialState) or the last UpdateComplex.state.
+   *  Without it the round cannot be settled here and is not adopted. */
+  state?: RoundState;
+  /** OpenComplex.mathVersion. A round is only adopted by the same math version. */
+  mathVersion?: string;
+}
+
 export interface SettleSimple {
   sessionId: string;
   /** Final bet in currency's minimal unit (integer).
@@ -548,6 +573,9 @@ export interface OpenComplex {
   bet: number;
   betIndex: number;
   priceMultiplier: number;
+  /** The mode the round is opened in. Spec 05 asks the wallet to persist it
+   *  so a resume on another process knows which math settles the round. */
+  modeId?: string;
   initialState: RoundState;
   mathVersion?: string;
   /** Promo pool id this round was consumed from, if any. */
