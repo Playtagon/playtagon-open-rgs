@@ -1,7 +1,7 @@
 // In-memory session store. The platform adapter is the source of truth;
 // LocalSession is a transient cache rebuilt on every INIT.
 
-import type { CarryState, RoundState, AwaitingHint, Op, PromoFreeRounds } from "@open-rgs/contract";
+import type { CarryState, RoundState, AwaitingHint, Op, PromoFreeRounds, WalletSettledRound } from "@open-rgs/contract";
 
 export interface LocalPromo {
   /** Opaque pool id surfaced from the adapter. */
@@ -73,6 +73,9 @@ export interface LocalSession {
   nextMode?: string;
   /** In-flight complex round, if any. */
   openRound?: OpenRound;
+  /** The last settled complex round as the wallet reported it at INIT: answers a
+   *  client retrying a CLOSE whose response was lost before a restart. */
+  lastSettledRound?: WalletSettledRound;
   promo?: LocalPromo;
   /** Highest balanceChanged event seq applied (see PlatformEvent.seq). Used
    *  to drop out-of-order/duplicate balance events. */

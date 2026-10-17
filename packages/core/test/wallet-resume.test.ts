@@ -16,10 +16,10 @@ import {
   defineGame,
   type PlatformAdapter, type SessionInfo, type SettleSimple, type OpenComplex,
   type CloseComplex, type RoundReceipt, type SimpleMath, type ComplexMath,
-  type ConnectionMeta, type PlatformEvent, type WalletOpenRound,
+  type ConnectionMeta, type PlatformEvent, type WalletOpenRound, type WalletSettledRound,
 } from "@open-rgs/contract";
 
-interface Stored { roundId: string; bet: number; modeId?: string; state: string; mathVersion?: string; openedAt: number; promoId?: string }
+interface Stored { roundId: string; bet: number; modeId?: string; state: string; mathVersion?: string; openedAt: number; promoId?: string; terms?: string }
 
 class DurableWallet implements PlatformAdapter {
   isHealthy = true;
@@ -27,6 +27,7 @@ class DurableWallet implements PlatformAdapter {
   balance = 100_000;
   open = new Map<string, Stored>();
   credits: number[] = [];
+  settled = new Map<string, WalletSettledRound>();
   closeKeys = new Set<string>();
   private seq = 0;
   /** Test knobs for adapters that persist less than Spec 05 asks. */
@@ -54,10 +55,13 @@ class DurableWallet implements PlatformAdapter {
       ...(this.dropState ? {} : { state: o.state }),
       ...(this.forceVersion ?? o.mathVersion ? { mathVersion: this.forceVersion ?? o.mathVersion } : {}),
       ...(o.promoId ? { promoId: o.promoId } : {}),
+      ...(o.terms ? { terms: o.terms } : {}),
     }
+    const last = this.settled.get(sessionId);
     return {
       sessionId, currency: "USD", currencyDecimals: 2, balance: this.balance, allowedBets: [100], defaultBetIndex: 0,
       ...(openRound ? { openRound } : {}),
+      ...(last ? { lastSettledRound: last } : {}),
       ...(this.promo && this.promo.remaining > 0 ? { promo: { ...this.promo } } : {}),
     };
   }
@@ -71,6 +75,7 @@ class DurableWallet implements PlatformAdapter {
       roundId, bet: req.bet, ...(req.modeId ? { modeId: req.modeId } : {}), state: req.initialState,
       ...(req.mathVersion ? { mathVersion: req.mathVersion } : {}), openedAt: 1_700_000_000_000,
       ...(req.promoId ? { promoId: req.promoId } : {}),
+      ...(req.terms ? { terms: req.terms } : {}),
     });
     return { roundId, balance: this.balance };
   }
@@ -82,6 +87,12 @@ class DurableWallet implements PlatformAdapter {
     this.credits.push(req.win);
     if (req.idempotencyKey) this.closeKeys.add(req.idempotencyKey);
     this.open.delete(req.sessionId);
+    this.settled.set(req.sessionId, {
+      roundId: req.roundId, modeId: o.modeId ?? "", win: req.win, multiplier: req.multiplier, type: req.type,
+      balance: this.balance, finalState: req.finalState,
+      ...(req.mathVersion ? { mathVersion: req.mathVersion } : {}),
+      ...(req.requestKey ? { requestKey: req.requestKey } : {}),
+    });
     return { roundId: req.roundId, balance: this.balance };
   }
   onEvent(_h: (e: PlatformEvent) => void) {}
@@ -99,10 +110,11 @@ function simple(version = "1.0.0"): SimpleMath {
   };
 }
 
-function runtime(wallet: DurableWallet, m: ComplexMath, auditMode: "best-effort" | "mandatory" = "best-effort") {
+function runtime(wallet: DurableWallet, m: ComplexMath, auditMode: "best-effort" | "mandatory" = "best-effort",
+  terms: { buyStake?: number; maxWin?: number } = {}) {
   const manifest = defineGame({
-    id: "g", declaredRtp: 0.96, defaultMode: "base", maxWinMultiplier: 10_000,
-    modes: { base: { math: m, stakeMultiplier: 1 }, buy: { math: m, stakeMultiplier: 50 } },
+    id: "g", declaredRtp: 0.96, defaultMode: "base", maxWinMultiplier: terms.maxWin ?? 10_000,
+    modes: { base: { math: m, stakeMultiplier: 1 }, buy: { math: m, stakeMultiplier: terms.buyStake ?? 50 } },
   });
   const orch = createOrchestrator({ manifest, platform: wallet, auditMode });
   const conn: ConnectionMeta = { connectionId: `c-${Math.random()}`, sessionId: null, demo: false };
@@ -110,7 +122,7 @@ function runtime(wallet: DurableWallet, m: ComplexMath, auditMode: "best-effort"
 }
 
 // The session cache is module-level and shared with other suites: never leave ours behind.
-afterEach(() => { for (let i = 1; i <= 9; i++) forgetSession(`wr-s${i}`); });
+afterEach(() => { for (let i = 1; i <= 15; i++) forgetSession(`wr-s${i}`); });
 
 /** A pick game: open → one pick step → terminal. The state after the step is what pays. */
 function pickGame(): ComplexMath {
@@ -243,7 +255,7 @@ describe("adoption safety (security review)", () => {
     expect((await p2.orch.init({ sid: "wr-s8" }, p2.conn)).resume).toBeUndefined(); // no replay from the pre-pick state
   });
 
-  test("with mandatory checkpoints a stepped round resumes from the last step", async () => {
+  test("even with mandatory checkpoints a round awaiting a decision is left to autoclose", async () => {
     const wallet = new DurableWallet();
     wallet.checkpoints = true;
     const p1 = runtime(wallet, pickGame(), "mandatory");
@@ -252,8 +264,76 @@ describe("adoption safety (security review)", () => {
     await p1.orch.stepRound({ action: { type: "pick", slot: 3 } }, p1.conn);
     forgetSession("wr-s9");
     const p2 = runtime(wallet, pickGame(), "mandatory");
-    expect((await p2.orch.init({ sid: "wr-s9" }, p2.conn)).resume).toBeDefined();
-    expect((await p2.orch.closeRound({}, p2.conn)).win).toBe(10 * 100);
+    // the pick is checkpointed here, but nothing recorded with the round proves it
+    // (process 1 might have run best-effort), so the round is not adopted
+    expect((await p2.orch.init({ sid: "wr-s9" }, p2.conn)).resume).toBeUndefined();
+  });
+
+  // --- Codex review 3 -----------------------------------------------------
+
+  test("a stepped round is not adopted even under mandatory audit: the opener's checkpoint policy is unknown", async () => {
+    // process 1 ran best-effort: its pick happened, its checkpoint did not land
+    const wallet = new DurableWallet();
+    const p1 = runtime(wallet, pickGame(), "best-effort");
+    await p1.orch.init({ sid: "wr-s10" }, p1.conn);
+    await p1.orch.openRound({ mode: "base" }, p1.conn);
+    await p1.orch.stepRound({ action: { type: "pick", slot: 1 } }, p1.conn);
+    forgetSession("wr-s10");
+    wallet.checkpoints = true; // process 2 is configured mandatory with checkpoints
+    const p2 = runtime(wallet, pickGame(), "mandatory");
+    expect((await p2.orch.init({ sid: "wr-s10" }, p2.conn)).resume).toBeUndefined(); // no second pick
+  });
+
+  test("two processes cannot both take a round that still awaits a decision", async () => {
+    const wallet = new DurableWallet();
+    wallet.checkpoints = true;
+    const p1 = runtime(wallet, pickGame(), "mandatory");
+    await p1.orch.init({ sid: "wr-s11" }, p1.conn);
+    await p1.orch.openRound({ mode: "base" }, p1.conn);
+    forgetSession("wr-s11");
+    const p2 = runtime(wallet, pickGame(), "mandatory");
+    const p3 = runtime(wallet, pickGame(), "mandatory");
+    const [a, b] = [await p2.orch.init({ sid: "wr-s11" }, p2.conn), await p3.orch.init({ sid: "wr-s11" }, p3.conn)];
+    // neither may branch the round's history (p2 picks 3, p3 picks 1)
+    expect(a.resume).toBeUndefined();
+    expect(b.resume).toBeUndefined();
+  });
+
+  test("a round is not adopted when the mode's price changed since it opened", async () => {
+    const wallet = new DurableWallet();
+    const p1 = runtime(wallet, withDeferredClose(simple()));
+    await p1.orch.init({ sid: "wr-s12" }, p1.conn);
+    await p1.orch.openRound({ mode: "buy" }, p1.conn); // 100 × 50 debited
+    forgetSession("wr-s12");
+    const p2 = runtime(wallet, withDeferredClose(simple()), "best-effort", { buyStake: 100 }); // same math, new price
+    expect((await p2.orch.init({ sid: "wr-s12" }, p2.conn)).resume).toBeUndefined();
+    expect(wallet.credits).toEqual([]);
+  });
+
+  test("a round is not adopted when the max-win cap changed since it opened", async () => {
+    const wallet = new DurableWallet();
+    const p1 = runtime(wallet, withDeferredClose(simple()));
+    await p1.orch.init({ sid: "wr-s13" }, p1.conn);
+    await p1.orch.openRound({ mode: "buy" }, p1.conn);
+    forgetSession("wr-s13");
+    const p2 = runtime(wallet, withDeferredClose(simple()), "best-effort", { maxWin: 5 });
+    expect((await p2.orch.init({ sid: "wr-s13" }, p2.conn)).resume).toBeUndefined();
+  });
+
+  test("a CLOSE whose response was lost is answered after a restart without a second credit", async () => {
+    const wallet = new DurableWallet();
+    const p1 = runtime(wallet, withDeferredClose(simple()));
+    await p1.orch.init({ sid: "wr-s14" }, p1.conn);
+    await p1.orch.openRound({ mode: "buy" }, p1.conn);
+    const first = await p1.orch.closeRound({ idempotencyKey: "close-1" }, p1.conn); // credited; the response never arrives
+    forgetSession("wr-s14"); // and the runtime dies
+    const p2 = runtime(wallet, withDeferredClose(simple()));
+    const init = await p2.orch.init({ sid: "wr-s14" }, p2.conn);
+    expect(init.resume).toBeUndefined();
+    const again = await p2.orch.closeRound({ idempotencyKey: "close-1" }, p2.conn);
+    expect(again).toEqual(first);
+    expect(wallet.credits).toEqual([first.win]);
+    // another token is not a retry of that close
+    await expect(p2.orch.closeRound({ idempotencyKey: "close-2" }, p2.conn)).rejects.toThrow(/No round in progress/);
   });
 });
-

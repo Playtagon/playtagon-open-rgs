@@ -565,6 +565,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       };
       const adopted = await adoptWalletOpenRound(req.sid, info.openRound);
       if (adopted) s.openRound = adopted;
+      else if (info.lastSettledRound) s.lastSettledRound = info.lastSettledRound;
 
       // put() can evict idle overflow. Those sessions are gone from the cache,
       // so their request-cache entries are unreachable state - drop them with
@@ -644,18 +645,32 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
   // --- WALLET-DRIVEN RESUME (ADR-007) ---------------------------------------
 
   /**
+   * The commercial terms a round is opened under: what it costs and what it may
+   * pay. Persisted with the round (OpenComplex.terms) so that a process whose
+   * manifest prices or caps the mode differently never settles it - the math
+   * version alone does not pin the price or the cap.
+   */
+  function roundTerms(mode: GameMode, promoFunded: boolean): string {
+    const cap = mode.maxWinMultiplier ?? manifest.maxWinMultiplier;
+    return `v1;stake=${promoFunded ? "promo" : mode.stakeMultiplier};cap=${cap ?? "none"}`;
+  }
+
+  /**
    * A complex round the wallet reports open but this process never saw (it was
    * opened before a restart or on another pod). Adopted only when it can be
    * settled faithfully here: a known complex mode, the persisted state, the same
-   * math version that produced it, and a state known to be CURRENT - either the
-   * outcome was fixed at open (the math's resume says the round only awaits the
-   * end-round action), or every step was checkpointed to the wallet (mandatory
-   * audit + updateComplex). A best-effort checkpoint may predate the last step,
-   * and replaying from it would let the round be played again. The cost is
-   * recomputed exactly as computeBet does: a promo-funded round at its bet, a
-   * paid one at `bet x stakeMultiplier`. Ops come from the wallet or the math's
-   * pure `resume` hook. Otherwise nothing is adopted and the round is left to
-   * the wallet's autoclose backstop (Spec 05).
+   * math version that produced it, the same commercial terms, and an outcome
+   * FIXED AT OPEN (the math's resume says the round only awaits the end-round
+   * action). A round still awaiting a decision is never adopted: nothing proves
+   * that the persisted state is the last step (the opener's checkpoint policy
+   * is not recorded with the round), and two processes adopting it could each
+   * accept a different decision. Fixed-at-open rounds have exactly one possible
+   * settlement, so concurrent adopters cannot diverge and the wallet's
+   * single-credit rule makes them settle once. The cost is recomputed exactly as
+   * computeBet does - a promo-funded round at its bet, a paid one at
+   * `bet x stakeMultiplier` - and equals the original because the terms match.
+   * Otherwise nothing is adopted and the round is left to the wallet's
+   * autoclose backstop (Spec 05).
    */
   async function adoptWalletOpenRound(sessionId: string, r: WalletOpenRound | undefined): Promise<OpenRound | undefined> {
     if (!r) return undefined;
@@ -687,8 +702,8 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         return skip(`math could not rebuild the round: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
-    const checkpointed = auditMode === "mandatory" && typeof platform.updateComplex === "function";
-    if (!fixedAtOpen && !checkpointed) return skip("the wallet's state may predate the last step (best-effort checkpoints)");
+    if (!fixedAtOpen) return skip("the round still awaits a decision; its persisted state may not be the last step");
+    if (r.terms !== roundTerms(mode, Boolean(r.promoId))) return skip("the mode's price or max-win cap differs from the round's terms");
     log.info("Open round adopted from the wallet", {
       "event.category": "orchestrator", "event.action": "resume_adopted",
       "session.id": sessionId, "round.id": r.roundId, "round.mode": r.modeId, "round.ops": ops.length,
@@ -900,6 +915,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         ...(mode.math.version ? { mathVersion: mode.math.version } : {}),
         idempotencyKey: initiatingIdemKey(s.sessionId, "open", req.idempotencyKey),
         ...(betInfo.promoId ? { promoId: betInfo.promoId } : {}),
+        terms: roundTerms(mode, Boolean(betInfo.promoId)),
       }));
     } catch (e) {
       // No-Money-No-Honey: the open's debit was declined -> no round opened, no
@@ -1010,7 +1026,11 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
   async function closeRound(req: ClientRequestCloseRound, conn: ConnectionMeta): Promise<ClientResponseCloseRound> {
     const s = sessionOrThrow(req.sid ?? conn.sessionId);
     const open = s.openRound;
-    if (!open) throw new RGSError("NO_ROUND_OPEN", "No round in progress");
+    if (!open) {
+      const recovered = await recoverSettledClose(s, req);
+      if (recovered) return recovered;
+      throw new RGSError("NO_ROUND_OPEN", "No round in progress");
+    }
 
     const mode = modeOrThrow(open.modeId);
     const math = mode.math as ComplexMath;
@@ -1052,6 +1072,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         // autoclose of the same round derive the identical key, so the
         // wallet dedupes any duplicate/raced close into one credit.
         idempotencyKey: deriveIdempotencyKey(s.sessionId, open.roundId, "close"),
+        ...(req.idempotencyKey ? { requestKey: closeRequestKey(s.sessionId, req.idempotencyKey) } : {}),
       }));
     } catch (e) {
       // The stake was taken at open and the credit just failed. That is the
@@ -1091,6 +1112,40 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       type: cappedClose.type,
       ...(notePlatformMaxWin(s.sessionId, receipt.roundId, receipt) ? { platformMaxWin: true as const } : {}),
     };
+  }
+
+  /** Wallet-side token of a client CLOSE (CloseComplex.requestKey). */
+  function closeRequestKey(sessionId: string, clientToken: string): string {
+    return deriveIdempotencyKey(sessionId, "close-request", clientToken);
+  }
+
+  /**
+   * A client retrying a CLOSE whose response was lost - and the process that
+   * settled it died, taking its response cache along. The wallet reported the
+   * settlement at INIT (SessionInfo.lastSettledRound) together with the token
+   * of the request that made it: the SAME token gets the original result back,
+   * rebuilt from the persisted final state, with no financial operation. Any
+   * other close stays NO_ROUND_OPEN.
+   */
+  async function recoverSettledClose(s: sessions.LocalSession, req: ClientRequestCloseRound): Promise<ClientResponseCloseRound | undefined> {
+    const done = s.lastSettledRound;
+    if (!done || !req.idempotencyKey || done.requestKey !== closeRequestKey(s.sessionId, req.idempotencyKey)) return undefined;
+    const mode = manifest.modes[done.modeId];
+    if (!mode || mode.math.kind !== "complex" || done.finalState === undefined) return undefined;
+    if (!done.mathVersion || done.mathVersion !== mode.math.version) return undefined;
+    let close;
+    try {
+      close = await Promise.resolve((mode.math as ComplexMath).close(done.finalState));
+    } catch {
+      return undefined;
+    }
+    // the recorded settlement is authoritative; a capped round carries its cap op
+    const ops = done.type === "max_win_reached" ? applyMaxWinCapClose(close, 0, done.multiplier).ops : close.ops;
+    log.info("Lost CLOSE response recovered from the wallet", {
+      "event.category": "orchestrator", "event.action": "close_recovered",
+      "session.id": s.sessionId, "round.id": done.roundId,
+    });
+    return { roundId: done.roundId, ops, balance: done.balance, win: done.win, multiplier: done.multiplier, type: done.type };
   }
 
   // --- Promo accept/decline ----------------------------------------------

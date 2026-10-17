@@ -427,6 +427,10 @@ export interface SessionInfo {
    *  "Open-round persistence & resume"). With `state` (and a matching
    *  `mathVersion`) the orchestrator adopts the round on any process. */
   openRound?: WalletOpenRound;
+  /** The session's most recently SETTLED complex round, if the wallet keeps it.
+   *  Lets a process that never saw the close answer a client retrying a CLOSE
+   *  whose response was lost (no second financial operation). */
+  lastSettledRound?: WalletSettledRound;
   /**
    * Platform data that belongs to the CLIENT, forwarded verbatim.
    *
@@ -541,6 +545,24 @@ export interface WalletOpenRound extends OpenRoundResume {
    *  a free round is priced at its bet (no stake fold), so without it the
    *  round would be valued like a paid one. */
   promoId?: string;
+  /** OpenComplex.terms. A round is only adopted under the same terms. */
+  terms?: string;
+}
+
+/** A settled complex round as the wallet recorded it (see SessionInfo.lastSettledRound). */
+export interface WalletSettledRound {
+  roundId: string;
+  modeId: string;
+  win: number;
+  multiplier: number;
+  type: string;
+  /** Wallet balance right after this round's credit. */
+  balance: number;
+  /** CloseComplex.finalState - the math rebuilds the close ops from it. */
+  finalState?: RoundState;
+  mathVersion?: string;
+  /** CloseComplex.requestKey of the close that settled it. */
+  requestKey?: string;
 }
 
 export interface SettleSimple {
@@ -585,6 +607,10 @@ export interface OpenComplex {
   /** Promo pool id this round was consumed from, if any. */
   promoId?: string;
   idempotencyKey?: string;
+  /** Opaque fingerprint of the round's commercial terms (price and max-win
+   *  cap). The wallet persists it and returns it in WalletOpenRound.terms; a
+   *  process whose manifest prices the mode differently does not adopt it. */
+  terms?: string;
 }
 
 export interface UpdateComplex {
@@ -617,6 +643,11 @@ export interface CloseComplex {
    *  trigger reason for the wallet's audit trail (e.g. "session-closed",
    *  "idle-timeout"). Absent for a normal client-initiated close. */
   reason?: string;
+  /** Opaque token of the CLIENT request that closed the round (derived from
+   *  the client's idempotency key). Observational: wallets must leave it, like
+   *  `reason`, out of their idempotency fingerprint. Returned in
+   *  WalletSettledRound.requestKey. */
+  requestKey?: string;
 }
 
 export interface RoundReceipt {
