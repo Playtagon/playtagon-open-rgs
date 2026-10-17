@@ -156,7 +156,9 @@ cache died too. The orchestrator therefore sends `CloseComplex.requestKey` (a
 token derived from the client's), and a wallet implementing the optional
 `PlatformAdapter.findSettledClose(sessionId, requestKey)` durably maps it to
 the round that close was ACCEPTED for - whether it credited the round or
-replayed an earlier settlement of it (an autoclose that got there first). A
+replayed an earlier settlement of it (an autoclose that got there first); a
+token already accepted for another round is refused and that close rolled back,
+so one token never belongs to two rounds. A
 CLOSE carrying a token is looked up FIRST, before anything is done with the
 current round: a known token returns that round's original result (close ops
 rebuilt from its final state, recorded win, multiplier, type and balance) with

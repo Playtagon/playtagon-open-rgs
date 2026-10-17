@@ -642,7 +642,9 @@ export interface CloseComplex {
    *  `reason`, out of their idempotency fingerprint. A wallet implementing
    *  `findSettledClose` durably maps it to the round this close settled -
    *  whether this call credited it or replayed an earlier settlement of it
-   *  (e.g. an autoclose that got there first). */
+   *  (e.g. an autoclose that got there first). A token already accepted for
+   *  ANOTHER round MUST be refused, rolling this close back: one client token
+   *  belongs to one round. */
   requestKey?: string;
 }
 
