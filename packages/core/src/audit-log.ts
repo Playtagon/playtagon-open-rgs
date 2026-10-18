@@ -67,7 +67,12 @@ export interface AuditEvent {
    *  RoundOutcomeStatus vocabulary. Optional for back-compat with hand-built
    *  AuditInput; defaults to "settled" when omitted. */
   outcomeStatus?: RoundOutcomeStatus;
+  /** The ladder rung the round was priced on (SettleSimple/OpenComplex.bet). */
   bet: number;
+  /** Full price multiplier (client price x stakeMultiplier); the round cost is
+   *  bet x priceMultiplier. Absent on events written before it was recorded
+   *  (and on an adopted legacy-v1 round), which then hash exactly as before. */
+  priceMultiplier?: number;
   win: number;
   multiplier: number;
   mathName: string;
@@ -109,6 +114,9 @@ function hashEvent(prevHash: string, e: Omit<AuditEvent, "hash">): string {
     // Same rule for the chain id: absent hashes as "", so an event written
     // before chains were named verifies unchanged.
     e.chainId ?? "",
+    // Appended only when present, so a chain written before the price was
+    // recorded verifies unchanged.
+    ...(e.priceMultiplier !== undefined ? [e.priceMultiplier] : []),
   ];
   return createHash("sha256").update(prevHash + "\n" + JSON.stringify(ordered)).digest("hex");
 }

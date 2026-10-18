@@ -372,53 +372,64 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     return { mode: modeId, betIndex: bet.betIndex, priceMultiplier: bet.priceMultiplier, cheat, params };
   }
 
+  /** The one place a round is priced. Every money path reads its result:
+   *
+   *    bet             = allowedBets[betIndex]          (the ladder rung, integer minor units)
+   *    clientPrice     = the client's priceMultiplier    (integer, 1..MAX_PRICE_MULTIPLIER)
+   *    priceMultiplier = clientPrice x stakeMultiplier   (what the wallet and the math see)
+   *    effectiveCost   = bet x priceMultiplier           (what the wallet debits)
+   *
+   *  `bet` never includes the client price: a wallet prices the round as
+   *  bet x priceMultiplier (Spec 05), so folding the price into both would
+   *  charge it twice (D x C^2). A promo-funded round is priced at its locked
+   *  bet with no stake fold and clientPrice 1. */
   function computeBet(
     s: sessions.LocalSession,
     mode: GameMode,
     modeId: string,
     requestedBetIndex: number | undefined,
     requestedPriceMultiplier: number | undefined,
-  ): { bet: number; betIndex: number; priceMultiplier: number; effectiveCost: number; promoId?: string } {
+  ): { bet: number; betIndex: number; clientPrice: number; priceMultiplier: number; effectiveCost: number; promoId?: string } {
     const promoOv = promo.activeOverride(s, modeId);
     if (promoOv) {
       const idx = s.allowedBets.indexOf(promoOv.bet);
       if (idx < 0) throw new RGSError("INVALID_BET", "Promo-locked bet not in allowedBets");
       // Promo-overridden free rounds skip stake fold by definition.
-      return { bet: promoOv.bet, betIndex: idx, priceMultiplier: 1, effectiveCost: promoOv.bet, promoId: promoOv.promoId };
+      return {
+        bet: promoOv.bet, betIndex: idx, clientPrice: 1, priceMultiplier: mode.stakeMultiplier,
+        effectiveCost: promoOv.bet, promoId: promoOv.promoId,
+      };
     }
     const betIndex = requestedBetIndex ?? s.defaultBetIndex;
     if (!Number.isInteger(betIndex) || betIndex < 0 || betIndex >= s.allowedBets.length) {
       throw new RGSError("INVALID_BET", `betIndex ${betIndex} out of range`);
     }
-    const baseBet = s.allowedBets[betIndex]!;
+    const bet = s.allowedBets[betIndex]!;
+    if (!Number.isSafeInteger(bet) || bet < 0) {
+      throw new RGSError("INVALID_BET", `ladder bet must be a non-negative integer minor unit within the safe range, got ${bet}`);
+    }
     // priceMultiplier is client-supplied, validate it like betIndex. A
     // crafted large/fractional value would otherwise inflate the bet or make
     // it non-integer (feeding the money path bad input). (M4)
-    const priceMultiplier = requestedPriceMultiplier ?? 1;
-    if (!Number.isInteger(priceMultiplier) || priceMultiplier < 1 || priceMultiplier > MAX_PRICE_MULTIPLIER) {
-      throw new RGSError("INVALID_BET", `priceMultiplier must be an integer in [1, ${MAX_PRICE_MULTIPLIER}], got ${priceMultiplier}`);
+    const clientPrice = requestedPriceMultiplier ?? 1;
+    if (!Number.isInteger(clientPrice) || clientPrice < 1 || clientPrice > MAX_PRICE_MULTIPLIER) {
+      throw new RGSError("INVALID_BET", `priceMultiplier must be an integer in [1, ${MAX_PRICE_MULTIPLIER}], got ${clientPrice}`);
     }
-    // `bet` stays integer minor units: base x client priceMultiplier
-    // (both integers). The mode's stakeMultiplier, which can be
-    // fractional, e.g. 1.25 for ante, is NOT folded into bet. That
-    // would have broken bets with fractional stakes (1 x 1.25 = 1.25
-    // != integer) and made every adapter that reads `bet` directly see
-    // a stake-blended number it didn't ask for. Instead the stake
-    // rides on the platform-side `priceMultiplier` (priceMul x stake)
-    // and is applied to wins via `effectiveCost` below. Audit H1's
-    // "wire bet is integer minor units" invariant is preserved.
-    const bet = baseBet * priceMultiplier;
-    if (!Number.isSafeInteger(bet) || bet < 0) {
-      throw new RGSError("INVALID_BET", `computed bet must be a non-negative integer minor unit within the safe range, got ${bet}`);
+    // The client-priced stake must stay an exact integer amount, whatever the
+    // mode's stake does to it afterwards (Audit H1: wire money is integers).
+    if (!Number.isSafeInteger(bet * clientPrice)) {
+      throw new RGSError("INVALID_BET", `bet ${bet} x priceMultiplier ${clientPrice} exceeds the safe integer range`);
     }
-    // effectiveCost = what's actually debited from the player. May be
-    // fractional in minor units; the platform sees (bet_index,
-    // priceMultiplier x stake) and computes its own debit at full
-    // currency precision. Used for balance check, max-win cap input,
-    // win calc, and the audit log's "amount paid" field, never sent
-    // on the wire as `bet`.
-    const effectiveCost = bet * mode.stakeMultiplier;
-    return { bet, betIndex, priceMultiplier, effectiveCost };
+    // The mode's stakeMultiplier can be fractional (ante 1.25), so the cost
+    // may be fractional in minor units; the wallet computes its own debit
+    // at full currency precision from (bet, priceMultiplier). Used for the
+    // balance check, the max-win cap input and the win.
+    const priceMultiplier = clientPrice * mode.stakeMultiplier;
+    const effectiveCost = bet * priceMultiplier;
+    if (!Number.isFinite(priceMultiplier) || !Number.isFinite(effectiveCost) || effectiveCost < 0) {
+      throw new RGSError("INVALID_BET", `round cost is not representable: ${bet} x ${priceMultiplier}`);
+    }
+    return { bet, betIndex, clientPrice, priceMultiplier, effectiveCost };
   }
 
   function modeCatalogForClient() {
@@ -613,6 +624,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         roundId: s.openRound.roundId,
         modeId: s.openRound.modeId,
         bet: s.openRound.bet,
+        ...(s.openRound.priceMultiplier !== undefined ? { priceMultiplier: s.openRound.priceMultiplier } : {}),
         ops: s.openRound.opsLog,
         actionLog: s.openRound.actionLog,
         ...(s.openRound.awaiting ? { awaiting: s.openRound.awaiting } : {}),
@@ -648,10 +660,44 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
    * pay. Persisted with the round (OpenComplex.terms) so that a process whose
    * manifest prices or caps the mode differently never settles it - the math
    * version alone does not pin the price or the cap.
+   *
+   * v2 (current) also records the client price `cp`, because `bet` is the bare
+   * ladder rung and the round's cost is bet x cp x stake: adoption reprices the
+   * round from its own terms, never from whatever the client sends next.
+   * v1 rounds were opened while `bet` still carried the client price
+   * (bet = rung x cp); they are only ever read, never written (legacyTerms).
    */
-  function roundTerms(mode: GameMode, promoFunded: boolean): string {
+  function roundTerms(mode: GameMode, promoFunded: boolean, clientPrice: number): string {
+    const cap = mode.maxWinMultiplier ?? manifest.maxWinMultiplier;
+    return `v2;stake=${promoFunded ? "promo" : mode.stakeMultiplier};cap=${cap ?? "none"};cp=${clientPrice}`;
+  }
+
+  function legacyTerms(mode: GameMode, promoFunded: boolean): string {
     const cap = mode.maxWinMultiplier ?? manifest.maxWinMultiplier;
     return `v1;stake=${promoFunded ? "promo" : mode.stakeMultiplier};cap=${cap ?? "none"}`;
+  }
+
+  /** How an adopted round is priced, read back from its persisted terms. */
+  function pricingFromTerms(
+    mode: GameMode, r: WalletOpenRound,
+  ): { priceMultiplier?: number; effectiveCost: number } | string {
+    const promoFunded = Boolean(r.promoId);
+    if (r.terms !== undefined && r.terms === legacyTerms(mode, promoFunded)) {
+      // v1: the opener sent bet = rung x clientPrice, so its cost was
+      // bet x stake. Kept exactly, a restart must not reprice an old round.
+      return { effectiveCost: promoFunded ? r.bet : r.bet * mode.stakeMultiplier };
+    }
+    const cp = /;cp=([^;]*)$/.exec(r.terms ?? "")?.[1];
+    const clientPrice = cp !== undefined && /^[1-9][0-9]*$/.test(cp) ? Number(cp) : NaN;
+    if (!Number.isSafeInteger(clientPrice) || clientPrice > MAX_PRICE_MULTIPLIER) {
+      return "the round's terms carry no valid client price";
+    }
+    if (r.terms !== roundTerms(mode, promoFunded, clientPrice)) {
+      return "the mode's price or max-win cap differs from the round's terms";
+    }
+    if (promoFunded) return { priceMultiplier: mode.stakeMultiplier, effectiveCost: r.bet };
+    const priceMultiplier = clientPrice * mode.stakeMultiplier;
+    return { priceMultiplier, effectiveCost: r.bet * priceMultiplier };
   }
 
   /**
@@ -665,9 +711,10 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
    * is not recorded with the round), and two processes adopting it could each
    * accept a different decision. Fixed-at-open rounds have exactly one possible
    * settlement, so concurrent adopters cannot diverge and the wallet's
-   * single-credit rule makes them settle once. The cost is recomputed exactly as
-   * computeBet does - a promo-funded round at its bet, a paid one at
-   * `bet x stakeMultiplier` - and equals the original because the terms match.
+   * single-credit rule makes them settle once. The cost is recomputed from the
+   * round's own terms exactly as computeBet did - a promo-funded round at its
+   * bet, a paid one at `bet x clientPrice x stakeMultiplier` (legacy v1:
+   * `bet x stakeMultiplier`) - and equals the original because the terms match.
    * Otherwise nothing is adopted and the round is left to the wallet's
    * autoclose backstop (Spec 05).
    */
@@ -702,7 +749,8 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       }
     }
     if (!fixedAtOpen) return skip("the round still awaits a decision; its persisted state may not be the last step");
-    if (r.terms !== roundTerms(mode, Boolean(r.promoId))) return skip("the mode's price or max-win cap differs from the round's terms");
+    const pricing = pricingFromTerms(mode, r);
+    if (typeof pricing === "string") return skip(pricing);
     log.info("Open round adopted from the wallet", {
       "event.category": "orchestrator", "event.action": "resume_adopted",
       "session.id": sessionId, "round.id": r.roundId, "round.mode": r.modeId, "round.ops": ops.length,
@@ -711,8 +759,8 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       roundId: r.roundId,
       modeId: r.modeId,
       bet: r.bet,
-      // as computeBet: promo-overridden free rounds skip the stake fold
-      effectiveCost: r.promoId ? r.bet : r.bet * mode.stakeMultiplier,
+      ...(pricing.priceMultiplier !== undefined ? { priceMultiplier: pricing.priceMultiplier } : {}),
+      effectiveCost: pricing.effectiveCost,
       state: r.state,
       ...(r.promoId ? { promoId: r.promoId } : {}),
       ...(awaiting ? { awaiting } : {}),
@@ -745,7 +793,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       // Refused before anything moved - the audit vocabulary's `rejected`.
       recordAudit(mode, {
         sessionId: s.sessionId, roundId: "", kind: "settle",
-        type: "insufficient-balance", bet: betInfo.bet, win: 0, multiplier: 0, reason: "",
+        type: "insufficient-balance", bet: betInfo.bet, priceMultiplier: betInfo.priceMultiplier, win: 0, multiplier: 0, reason: "",
         outcomeStatus: "rejected",
       });
       throw new RGSError("INSUFFICIENT_BALANCE", `cost ${betInfo.effectiveCost} > balance ${s.balance}`);
@@ -755,7 +803,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     // first-class wire field. Ignored entirely when cheatsEnabled is false.
     const ctx = buildSpinContext(
       requestedMode,
-      { betIndex: betInfo.betIndex, priceMultiplier: betInfo.priceMultiplier * mode.stakeMultiplier },
+      { betIndex: betInfo.betIndex, priceMultiplier: betInfo.priceMultiplier },
       req.params?.["cheat"] as Record<string, unknown> | undefined,
       req.params,
     );
@@ -793,13 +841,14 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         win,
         bet:        betInfo.bet,
         bet_index:  betInfo.betIndex,
+        price_multiplier: betInfo.priceMultiplier,
       });
 
       receipt = await timedPlatformCall(metrics, "settleSimple", () => platform.settleSimple({
         sessionId: s.sessionId,
         bet: betInfo.bet,
         betIndex: betInfo.betIndex,
-        priceMultiplier: betInfo.priceMultiplier * mode.stakeMultiplier,
+        priceMultiplier: betInfo.priceMultiplier,
         win,
         multiplier: cappedOutcome.multiplier,
         type: cappedOutcome.type,
@@ -815,7 +864,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       // yet) so the audit trail shows a `failed-bet`, never a phantom `settled`.
       recordAudit(mode, {
         sessionId: s.sessionId, roundId: "", kind: "settle",
-        type: cappedOutcome.type, bet: betInfo.bet, win: 0, multiplier: 0, reason: "",
+        type: cappedOutcome.type, bet: betInfo.bet, priceMultiplier: betInfo.priceMultiplier, win: 0, multiplier: 0, reason: "",
         outcomeStatus: "failed-bet",
       });
       throw translate(e, "SPIN_FAILED");
@@ -849,6 +898,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       ops: cappedOutcome.ops,
       balance: receipt.balance,
       bet: betInfo.bet,
+      priceMultiplier: betInfo.priceMultiplier,
       win,
       multiplier: cappedOutcome.multiplier,
       type: cappedOutcome.type,
@@ -881,7 +931,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     if (!betInfo.promoId && betInfo.effectiveCost > s.balance) {
       recordAudit(mode, {
         sessionId: s.sessionId, roundId: "", kind: "open",
-        type: "insufficient-balance", bet: betInfo.bet, win: 0, multiplier: 0, reason: "",
+        type: "insufficient-balance", bet: betInfo.bet, priceMultiplier: betInfo.priceMultiplier, win: 0, multiplier: 0, reason: "",
         outcomeStatus: "rejected",
       });
       throw new RGSError("INSUFFICIENT_BALANCE", `cost ${betInfo.effectiveCost} > balance ${s.balance}`);
@@ -893,7 +943,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     // most needed, because everything after it is a branch.
     const ctx = buildSpinContext(
       requestedMode,
-      { betIndex: betInfo.betIndex, priceMultiplier: betInfo.priceMultiplier * mode.stakeMultiplier },
+      { betIndex: betInfo.betIndex, priceMultiplier: betInfo.priceMultiplier },
       req.params?.["cheat"] as Record<string, unknown> | undefined,
       req.params,
     );
@@ -908,20 +958,20 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         sessionId: s.sessionId,
         bet: betInfo.bet,
         betIndex: betInfo.betIndex,
-        priceMultiplier: betInfo.priceMultiplier * mode.stakeMultiplier,
+        priceMultiplier: betInfo.priceMultiplier,
         modeId: requestedMode,
         initialState: open.state,
         ...(mode.math.version ? { mathVersion: mode.math.version } : {}),
         idempotencyKey: initiatingIdemKey(s.sessionId, "open", req.idempotencyKey),
         ...(betInfo.promoId ? { promoId: betInfo.promoId } : {}),
-        terms: roundTerms(mode, Boolean(betInfo.promoId)),
+        terms: roundTerms(mode, Boolean(betInfo.promoId), betInfo.clientPrice),
       }));
     } catch (e) {
       // No-Money-No-Honey: the open's debit was declined -> no round opened, no
       // state kept. Log the failed attempt rather than leaving a silent gap.
       recordAudit(mode, {
         sessionId: s.sessionId, roundId: "", kind: "open",
-        type: "open", bet: betInfo.bet, win: 0, multiplier: 0, reason: "",
+        type: "open", bet: betInfo.bet, priceMultiplier: betInfo.priceMultiplier, win: 0, multiplier: 0, reason: "",
         outcomeStatus: "failed-bet",
       });
       throw translate(e, "OPEN_FAILED");
@@ -937,6 +987,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       roundId: receipt.roundId,
       modeId: requestedMode,
       bet: betInfo.bet,
+      priceMultiplier: betInfo.priceMultiplier,
       effectiveCost: betInfo.effectiveCost,
       state: open.state,
       ...(open.awaiting ? { awaiting: open.awaiting } : {}),
@@ -947,7 +998,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     };
     recordAudit(mode, {
       sessionId: s.sessionId, roundId: receipt.roundId, kind: "open",
-      type: "open", bet: betInfo.bet, win: 0, multiplier: 0, reason: "",
+      type: "open", bet: betInfo.bet, priceMultiplier: betInfo.priceMultiplier, win: 0, multiplier: 0, reason: "",
       outcomeStatus: "opened",
     });
 
@@ -956,6 +1007,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       ops: open.ops,
       balance: receipt.balance,
       bet: betInfo.bet,
+      priceMultiplier: betInfo.priceMultiplier,
       awaiting: open.awaiting,
     };
   }
@@ -1083,7 +1135,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       // autoclose - no state is discarded here.
       recordAudit(mode, {
         sessionId: s.sessionId, roundId: open.roundId, kind: "close",
-        type: cappedClose.type, bet: open.bet, win, multiplier: cappedClose.multiplier, reason: "",
+        type: cappedClose.type, bet: open.bet, ...(open.priceMultiplier !== undefined ? { priceMultiplier: open.priceMultiplier } : {}), win, multiplier: cappedClose.multiplier, reason: "",
         outcomeStatus: "failed-win",
       });
       throw translate(e, "CLOSE_FAILED");
@@ -1098,7 +1150,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     if (receipt.promo) promo.applyUpdate(s, receipt.promo);
     recordAudit(mode, {
       sessionId: s.sessionId, roundId: receipt.roundId, kind: "close",
-      type: cappedClose.type, bet: open.bet, win, multiplier: cappedClose.multiplier, reason: "",
+      type: cappedClose.type, bet: open.bet, ...(open.priceMultiplier !== undefined ? { priceMultiplier: open.priceMultiplier } : {}), win, multiplier: cappedClose.multiplier, reason: "",
       outcomeStatus: cappedClose.type === "max_win_reached" ? "settled-max-win" : "settled",
     });
     s.openRound = undefined;
@@ -1302,7 +1354,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       // client close (see closeRound). The round stays open.
       recordAudit(mode, {
         sessionId: s.sessionId, roundId: open.roundId, kind: "autoclose",
-        type: cappedClose.type, bet: open.bet, win, multiplier: cappedClose.multiplier, reason: req.reason,
+        type: cappedClose.type, bet: open.bet, ...(open.priceMultiplier !== undefined ? { priceMultiplier: open.priceMultiplier } : {}), win, multiplier: cappedClose.multiplier, reason: req.reason,
         outcomeStatus: "failed-win",
       });
       return { closed: false, reason: `platform-error: ${e instanceof Error ? e.message : String(e)}` };
@@ -1321,7 +1373,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     if (receipt.promo) promo.applyUpdate(s, receipt.promo);
     recordAudit(mode, {
       sessionId: s.sessionId, roundId: receipt.roundId, kind: "autoclose",
-      type: cappedClose.type, bet: open.bet, win, multiplier: cappedClose.multiplier, reason: req.reason,
+      type: cappedClose.type, bet: open.bet, ...(open.priceMultiplier !== undefined ? { priceMultiplier: open.priceMultiplier } : {}), win, multiplier: cappedClose.multiplier, reason: req.reason,
       outcomeStatus: "autoclosed",
     });
     s.openRound = undefined;

@@ -127,10 +127,12 @@ export interface SpinContext {
    *  a host embedding this contract without an orchestrator (the simulator's
    *  bare harness) has no ladder to index. */
   betIndex?: number;
-  /** Price multiplier for THIS round (client price x mode stakeMultiplier),
-   *  as resolved by the orchestrator. 1 for an ordinary round, higher for a
-   *  feature buy, 0 for a promo-funded one. Same server-authoritative
-   *  guarantee as {@link betIndex}. */
+  /** Full price multiplier for THIS round (client price x mode
+   *  stakeMultiplier), as resolved by the orchestrator: the same number the
+   *  wallet is charged with (cost = allowedBets[betIndex] x priceMultiplier).
+   *  1 for an ordinary round, the mode's stake for a feature buy or ante, the
+   *  number of chips for a multi-chip table round on a stake-1 mode. Same
+   *  server-authoritative guarantee as {@link betIndex}. */
   priceMultiplier?: number;
   /** Dev-only forced-outcome hint. Populated by the orchestrator ONLY when
    *  cheats are explicitly enabled (createServer `enableCheats` /
@@ -503,7 +505,14 @@ export interface PromoFreeRounds {
 export interface OpenRoundResume {
   roundId: string;
   modeId: string;
+  /** The ladder rung the round was priced on (see {@link SettleSimple.bet}). */
   bet: number;
+  /** Full price multiplier of the round: its cost is bet x priceMultiplier.
+   *  Present in what the orchestrator sends a client; a wallet need not
+   *  return it (the orchestrator reprices from the persisted terms). Absent
+   *  for a round adopted under legacy v1 terms, whose `bet` already carried
+   *  the client price. */
+  priceMultiplier?: number;
   /** Cumulative ops emitted so far (open + every step). Replay to render. */
   ops: Op[];
   /** Player actions taken so far in this round. */
@@ -559,14 +568,26 @@ export interface WalletSettledRound {
   mathVersion?: string;
 }
 
+/** Round pricing, the same in every wallet call (Spec 05 "Round price"):
+ *
+ *    bet             = allowedBets[betIndex]               the ladder rung, integer minor units
+ *    priceMultiplier = client priceMultiplier x stakeMultiplier
+ *    cost            = bet x priceMultiplier               the debit
+ *
+ *  `bet` never includes the client price or the stake. A wallet that prices a
+ *  round any other way (from its own ladder and the index, say) MUST arrive at
+ *  the same cost. For a promo-funded round the wallet debits nothing and the
+ *  round is valued at `bet`. */
 export interface SettleSimple {
   sessionId: string;
-  /** Final bet in currency's minimal unit (integer).
-   *  Includes priceMultiplier x stakeMultiplier already. */
+  /** The ladder rung, allowedBets[betIndex], in the currency's minimal unit
+   *  (integer). Does NOT include priceMultiplier: the cost is
+   *  bet x priceMultiplier. */
   bet: number;
   /** Index into the session's allowed_bets ladder, what the player picked. */
   betIndex: number;
-  /** Multiplier applied to the chosen bet level (mode stakeMultiplier x priceMultiplier). */
+  /** Full price multiplier: client priceMultiplier x mode stakeMultiplier.
+   *  May be fractional (ante 1.25). */
   priceMultiplier: number;
   /** Win in the currency's minimal unit (integer). */
   win: number;
@@ -590,8 +611,10 @@ export interface SettleSimple {
 
 export interface OpenComplex {
   sessionId: string;
+  /** The ladder rung; see {@link SettleSimple.bet}. Cost = bet x priceMultiplier. */
   bet: number;
   betIndex: number;
+  /** Full price multiplier; see {@link SettleSimple.priceMultiplier}. */
   priceMultiplier: number;
   /** The mode the round is opened in. Spec 05 asks the wallet to persist it
    *  so a resume on another process knows which math settles the round. */
@@ -601,9 +624,12 @@ export interface OpenComplex {
   /** Promo pool id this round was consumed from, if any. */
   promoId?: string;
   idempotencyKey?: string;
-  /** Opaque fingerprint of the round's commercial terms (price and max-win
-   *  cap). The wallet persists it and returns it in WalletOpenRound.terms; a
-   *  process whose manifest prices the mode differently does not adopt it. */
+  /** Opaque fingerprint of the round's commercial terms (client price, mode
+   *  stake and max-win cap). The wallet persists it verbatim and returns it in
+   *  WalletOpenRound.terms; a process whose manifest prices the mode
+   *  differently does not adopt it, and an adopted round is repriced from it,
+   *  never from the current request. Rounds opened before the client price was
+   *  recorded carry the legacy `v1;` form and keep their original price. */
   terms?: string;
 }
 
@@ -814,6 +840,9 @@ export interface ClientRequestSpin {
   sid?: string;
   mode?: string;
   betIndex?: number;
+  /** Client price, an integer in [1, 100000], default 1. Multiplies the
+   *  ladder rung chosen by betIndex; the mode's stakeMultiplier applies on
+   *  top. A table round sends its chip count here, a slot leaves it at 1. */
   priceMultiplier?: number;
   params?: Record<string, unknown>;
   /** Optional client-generated idempotency token. A round-initiating call
@@ -880,7 +909,11 @@ export interface ClientResponseSpin {
   roundId: string;
   ops: Op[];
   balance: number;
+  /** The ladder rung, allowedBets[betIndex]. The round cost is
+   *  bet x priceMultiplier. */
   bet: number;
+  /** Full price multiplier (client price x mode stakeMultiplier). */
+  priceMultiplier: number;
   win: number;
   multiplier: number;
   type: string;
@@ -896,7 +929,10 @@ export interface ClientResponseOpenRound {
   roundId: string;
   ops: Op[];
   balance: number;
+  /** The ladder rung; the round cost is bet x priceMultiplier. */
   bet: number;
+  /** Full price multiplier (client price x mode stakeMultiplier). */
+  priceMultiplier: number;
   awaiting?: AwaitingHint;
 }
 

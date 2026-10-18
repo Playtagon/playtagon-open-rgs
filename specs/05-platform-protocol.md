@@ -49,11 +49,22 @@ rounding modes.
 
 | Method | Effect |
 |--------|--------|
-| `settleSimple` | Atomically debit `bet` and credit `win`. Single transaction. |
-| `openComplex` | Debit `bet`. Returns `roundId` referenceable by close/update. |
+| `settleSimple` | Atomically debit the round price and credit `win`. Single transaction. |
+| `openComplex` | Debit the round price. Returns `roundId` referenceable by close/update. |
 | `updateComplex` | NO money movement. Pure audit/state-persistence. Idempotent. |
 | `closeComplex` | Credit `win` against the open round. Final transaction. |
 | `reverseRound` | OPTIONAL. Undo a settled round, money AND carry, latest-first. |
+
+#### Round price
+
+`bet` is the ladder rung (`allowedBets[betIndex]`, integer minor units) and
+`priceMultiplier` is the full multiplier (client price x mode
+`stakeMultiplier`, may be fractional). The round price, debited once, is
+`bet x priceMultiplier`. A wallet that prices from its own ladder and
+`betIndex` MUST arrive at the same amount. A wallet MUST reject a
+`priceMultiplier` that is not a finite non-negative number before moving
+money (conformance `errors.invalid-price`; `pricing.client-price` checks the
+debit for a client price of 3). A promo-funded round debits nothing.
 
 The orchestrator guarantees:
 
@@ -130,12 +141,16 @@ checkpoint) and `mathVersion` (from `OpenComplex.mathVersion`). On a fresh
 INIT the orchestrator adopts the round only when it can settle it faithfully:
 the mode exists and is complex, `state` is present and `mathVersion` equals the
 loaded math's version. The cost is recomputed as at open
-(`bet x stakeMultiplier`, or the bet alone for a promo-funded round, so a
-wallet MUST return `promoId` for such a round), and it equals the original
-price because the round must carry the same `terms` (`OpenComplex.terms`, an
-opaque fingerprint of the stake multiplier and max-win cap the round was opened
-under, persisted by the wallet and returned in `WalletOpenRound.terms`): the
-math version alone pins neither the price nor the cap. Only a round whose
+(`bet x clientPrice x stakeMultiplier`, or the bet alone for a promo-funded
+round, so a wallet MUST return `promoId` for such a round), and it equals the
+original price because the round must carry the same `terms` (`OpenComplex.terms`,
+an opaque fingerprint of the client price, stake multiplier and max-win cap the
+round was opened under, persisted by the wallet verbatim and returned in
+`WalletOpenRound.terms`): the math version alone pins neither the price nor the
+cap, and the client price is read from the terms, never from a later request.
+A round opened under the legacy `v1;` terms (before the client price was
+recorded, when `bet` still carried it) keeps its original cost
+`bet x stakeMultiplier`. Only a round whose
 outcome was FIXED AT OPEN is adopted (the math's `resume` reports it awaits
 just the end-round action, as `withDeferredClose` does). A round still awaiting
 a decision is never adopted, even under mandatory audit: nothing recorded with

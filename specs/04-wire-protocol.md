@@ -138,8 +138,11 @@ the player previously disconnected. The client SHOULD replay
 `resume.awaiting`. The action history `resume.actionLog` is provided so
 the client can narrate "you've already gambled twice."
 
-`ClientRequestSpin.priceMultiplier`: defaults to 1 if absent. Combined
-with the manifest's mode `stakeMultiplier` to compute the actual bet.
+`ClientRequestSpin.priceMultiplier`: the client price, an integer in
+`[1, 100000]`, defaults to 1 if absent. The round costs
+`allowedBets[betIndex] x priceMultiplier x stakeMultiplier`. Responses
+report `bet` as the ladder rung and `priceMultiplier` as the full multiplier
+(client price x stake), so the cost a client shows is `bet x priceMultiplier`.
 
 Forced-outcome cheats are **not** a wire field: `ClientRequestSpin` has no
 `cheat`. A forced-outcome field must never be part of the canonical

@@ -44,8 +44,9 @@ Outputs:
    `manifest.defaultMode`.
 3. Validate the resolved mode is `kind: "simple"`. Otherwise
    `INVALID_MODE`.
-4. Compute bet: `allowedBets[betIndex] x priceMultiplier x stakeMultiplier`.
-   promo active -> use promo-locked bet, force priceMultiplier=1.
+4. Price the round (see "Bet computation"): `bet = allowedBets[betIndex]`,
+   `priceMultiplier = clientPrice x stakeMultiplier`, cost `bet x priceMultiplier`.
+   promo active -> use promo-locked bet, force client price 1.
 5. Pre-flight balance check (skipped for promo). Insufficient ->
    `INSUFFICIENT_BALANCE`.
 6. Call `math.play(session.carry, ctx)`. `ctx` is `{ mode, cheat?, params? }`.
@@ -143,17 +144,33 @@ Always evaluated in this order, first match wins:
 ## Bet computation
 
 ```
-bet = allowedBets[betIndex] x priceMultiplier x stakeMultiplier
+bet             = allowedBets[betIndex]               (the ladder rung)
+priceMultiplier = clientPrice x stakeMultiplier
+cost            = bet x priceMultiplier               (the debit)
+win             = settleAmount(multiplier, cost)
 ```
 
 - `allowedBets`: per-session, from `SessionInfo`.
 - `betIndex`: from client, validated against array length.
-- `priceMultiplier`: from client, defaults to 1.
-- `stakeMultiplier`: from manifest's mode entry. 80 for buy-fs, etc.
+- `clientPrice`: the client's `priceMultiplier`, an integer in `[1, 100000]`,
+  defaults to 1. A table game sends its chip count here; `bet x clientPrice`
+  must be a safe integer.
+- `stakeMultiplier`: from manifest's mode entry. 80 for buy-fs, 1.25 for ante.
 
-The orchestrator passes `betIndex` and `priceMultiplier x stakeMultiplier`
-to the wallet so adapters can preserve their native (index, multiplier)
-audit trail.
+Every wallet call carries the same three numbers: `bet` (the rung, never
+scaled), `betIndex`, and the full `priceMultiplier`. The wallet debits
+`bet x priceMultiplier`; `SpinContext.priceMultiplier` is the same full value.
+`bet` must never also include the client price: before this was fixed the
+orchestrator sent `bet = rung x clientPrice` together with
+`priceMultiplier = clientPrice x stake`, so a wallet pricing the round as
+documented charged `rung x clientPrice^2 x stake`. Client responses
+(`ClientResponseSpin` / `ClientResponseOpenRound` / `OpenRoundResume`) carry
+the same `bet` and `priceMultiplier`.
+
+The round's terms (`OpenComplex.terms`, `v2;stake=..;cap=..;cp=..`) record the
+client price, so an adopted round is repriced from what it was opened at.
+Rounds opened under the legacy `v1;` terms are adopted at their original cost
+(`bet x stakeMultiplier`, their `bet` already carrying the client price).
 
 ### Free-round funding
 

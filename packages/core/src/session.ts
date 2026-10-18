@@ -28,14 +28,20 @@ export interface LocalPromo {
 export interface OpenRound {
   roundId: string;
   modeId: string;
-  /** base x priceMultiplier (integer minor units). Wire-safe; sent
-   *  through every platform call as `bet`. Does NOT include the mode's
-   *  stakeMultiplier: that rides on `priceMultiplier` instead. */
+  /** The ladder rung the round was priced on (allowedBets[betIndex]),
+   *  integer minor units. Sent through every platform call as `bet`.
+   *  Neither the client price nor the mode's stakeMultiplier is folded in:
+   *  both ride on `priceMultiplier`. A round adopted under legacy v1 terms
+   *  keeps the bet its opener sent (which did include the client price). */
   bet: number;
-  /** bet x stakeMultiplier, what was actually debited from the player.
-   *  May be fractional for stake-adjusted modes (e.g. ante 1.25x on a
-   *  1-unit base = 1.25). Used for balance check, max-win cap, win
-   *  calculation, and the audit log's "amount paid" field. */
+  /** Full price multiplier (client price x stakeMultiplier) the wallet was
+   *  charged with: cost = bet x priceMultiplier. Absent only for a round
+   *  adopted under legacy v1 terms, whose wallet price is not recoverable. */
+  priceMultiplier?: number;
+  /** What was actually debited from the player: bet x priceMultiplier
+   *  (promo-funded: the bet). May be fractional for stake-adjusted modes
+   *  (e.g. ante 1.25x on a 1-unit base = 1.25). Used for balance check,
+   *  max-win cap, win calculation. */
   effectiveCost: number;
   state: RoundState;
   awaiting?: AwaitingHint;

@@ -818,6 +818,7 @@ export class ArtubeAdapter implements PlatformAdapter {
   }
 
   private async settleSimpleOnce(req: SettleSimple): Promise<RoundReceipt> {
+    assertPriceMultiplier(req.priceMultiplier);
     // Artube's PlayRoundRequest validator requires round_state to be a
     // non-empty string. core ≥0.3.0's orchestrator now always sends a
     // non-empty envelope (math carry, or a synthesised {type,multiplier,
@@ -866,6 +867,7 @@ export class ArtubeAdapter implements PlatformAdapter {
   // round is addressed by. Nothing else moves money until CloseRound.
 
   async openComplex(req: OpenComplex): Promise<RoundReceipt> {
+    assertPriceMultiplier(req.priceMultiplier);
     const stateVersion = req.mathVersion ?? this.defaultRoundStateVersion;
     const features = extractFeatures(req.initialState);
 
@@ -1969,3 +1971,12 @@ export {
   type DemoSessionView,
   type DemoRound,
 } from "./demo.js";
+
+/** The wallet prices a round as allowedBets[betIndex] x price_multiplier, so a
+ *  multiplier that is not a finite non-negative number has no cost at all.
+ *  Refuse it here rather than put it on the wire. */
+function assertPriceMultiplier(p: number): void {
+  if (typeof p !== "number" || !Number.isFinite(p) || p < 0) {
+    throw new Error(`InvalidAmount: priceMultiplier must be a finite non-negative number, got ${String(p)}`);
+  }
+}
