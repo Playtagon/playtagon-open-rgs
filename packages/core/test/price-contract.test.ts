@@ -15,6 +15,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { createOrchestrator } from "../src/index.js";
+import { createAuditLog, memoryAuditSink, verifyChain } from "../src/audit-log.js";
 import { withDeferredClose } from "../src/deferred-close.js";
 import { remove as forgetSession } from "../src/session.js";
 import { MockPlatform } from "@open-rgs/platform-mock";
@@ -319,5 +320,27 @@ describe("restart: a round is settled at the price it was opened at", () => {
     const init = await p.orch.init({ sid: "pc-tampered" }, p.conn);
     expect(init.resume).toBeUndefined();
     expect(wallet.credits).toEqual([]);
+  });
+});
+
+describe("audit: every money event records the price it was charged at", () => {
+  test("a losing C=3 simple spin is distinguishable from a C=1 one, and the price is in the hash", async () => {
+    const platform = new RecordingMock({ startingBalance: 100_000, allowedBets: [100], defaultBetIndex: 0, currencyDecimals: 2, currency: "FUN" });
+    const sink = memoryAuditSink();
+    const orch = createOrchestrator({
+      platform, auditLog: createAuditLog(sink),
+      manifest: defineGame({ id: "a", declaredRtp: 0.96, defaultMode: "normal", maxWinMultiplier: 100, modes: { normal: { math: fixedMath(0), stakeMultiplier: 1 } } }),
+    });
+    const conn: ConnectionMeta = { connectionId: "audit", sessionId: null, demo: true };
+    sessionIds.push("pc-audit");
+    await platform.connect();
+    await orch.init({ sid: "pc-audit" }, conn);
+    await orch.spin({ priceMultiplier: 3 }, conn);
+    await orch.spin({ priceMultiplier: 1 }, conn);
+    const settled = sink.events.filter((e) => e.kind === "settle" && e.outcomeStatus === "settled");
+    expect(settled.map((e) => [e.bet, e.priceMultiplier, e.win])).toEqual([[100, 3, 0], [100, 1, 0]]);
+    expect(verifyChain(sink.events)).toBe(-1);
+    const forged = sink.events.map((e) => (e === settled[0] ? { ...e, priceMultiplier: 1 } : e));
+    expect(verifyChain(forged)).not.toBe(-1);
   });
 });

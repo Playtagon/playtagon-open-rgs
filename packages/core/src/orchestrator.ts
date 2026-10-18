@@ -879,7 +879,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     sessions.setCarry(s.sessionId, cappedOutcome.carry, cappedOutcome.nextMode);
     recordAudit(mode, {
       sessionId: s.sessionId, roundId: receipt.roundId, kind: "settle",
-      type: cappedOutcome.type, bet: betInfo.bet, win, multiplier: cappedOutcome.multiplier, reason: "",
+      type: cappedOutcome.type, bet: betInfo.bet, priceMultiplier: betInfo.priceMultiplier, win, multiplier: cappedOutcome.multiplier, reason: "",
       outcomeStatus: cappedOutcome.type === "max_win_reached" ? "settled-max-win" : "settled",
     });
 
