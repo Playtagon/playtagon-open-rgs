@@ -35,7 +35,7 @@
 
 import type {
   CarryState, ComplexMath, CloseOutcome, OpenOutcome, RoundOutcome, RoundState,
-  SimpleMath, SpinContext, StepOutcome, PlayerAction,
+  SimpleMath, SpinContext, StepOutcome, PlayerAction, ResumeView,
 } from "@open-rgs/contract";
 
 /** Action type the client sends to finish a deferred-close round. Also the
@@ -151,6 +151,14 @@ export function withDeferredClose(
         ...(p.carry !== undefined ? { carry: p.carry } : {}),
         ...(p.nextMode !== undefined ? { nextMode: p.nextMode } : {}),
       };
+    },
+
+    // A process that did not open the round (restart, another pod) rebuilds
+    // what the client saw from the parked outcome - the same ops, the same
+    // end-round hint (ADR-007). The layout of the parked state stays private
+    // to this wrapper.
+    resume(state: RoundState): ResumeView {
+      return { ops: unpark(state).ops, awaiting };
     },
 
     // External trigger (wallet, admin, reconciliation) settles an abandoned

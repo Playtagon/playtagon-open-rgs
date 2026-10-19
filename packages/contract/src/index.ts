@@ -281,6 +281,17 @@ export interface ComplexMath {
 
   /** Optional autoclose resolver: produce a close outcome from current state. */
   autoclose?(state: RoundState): CloseOutcome | Promise<CloseOutcome>;
+
+  /** Optional (ADR-007): rebuild the render ops and the `awaiting` hint of an
+   *  open round from its state, for a resume on a process that did not open
+   *  it (ops never cross to the wallet). Pure: no RNG, no side effects. */
+  resume?(state: RoundState): ResumeView | Promise<ResumeView>;
+}
+
+/** What a math can rebuild from an open round's state (see ComplexMath.resume). */
+export interface ResumeView {
+  ops: Op[];
+  awaiting?: AwaitingHint;
 }
 
 export type MathModule = SimpleMath | ComplexMath;
@@ -412,8 +423,10 @@ export interface SessionInfo {
   defaultBetIndex: number;
   /** Active promo free-rounds pool, if any. */
   promo?: PromoFreeRounds;
-  /** Open round to resume on reconnect, if any. */
-  openRound?: OpenRoundResume;
+  /** Open round to resume on reconnect, if any (ADR-007, Spec 05
+   *  "Open-round persistence & resume"). With `state` (and a matching
+   *  `mathVersion`) the orchestrator adopts the round on any process. */
+  openRound?: WalletOpenRound;
   /**
    * Platform data that belongs to the CLIENT, forwarded verbatim.
    *
@@ -514,6 +527,38 @@ export interface OpenRoundResume {
   };
 }
 
+/** The open round as the WALLET knows it (Spec 05 §"Open-round persistence &
+ *  resume"). It extends the client-facing resume with what only the server may
+ *  hold: the round's last state checkpoint and the math version that produced
+ *  it. The orchestrator never forwards `state` to a client. */
+export interface WalletOpenRound extends OpenRoundResume {
+  /** Initial state (OpenComplex.initialState) or the last UpdateComplex.state.
+   *  Without it the round cannot be settled here and is not adopted. */
+  state?: RoundState;
+  /** OpenComplex.mathVersion. A round is only adopted by the same math version. */
+  mathVersion?: string;
+  /** OpenComplex.promoId. A wallet MUST return it for a promo-funded round:
+   *  a free round is priced at its bet (no stake fold), so without it the
+   *  round would be valued like a paid one. */
+  promoId?: string;
+  /** OpenComplex.terms. A round is only adopted under the same terms. */
+  terms?: string;
+}
+
+/** A settled complex round as the wallet recorded it (see PlatformAdapter.findSettledClose). */
+export interface WalletSettledRound {
+  roundId: string;
+  modeId: string;
+  win: number;
+  multiplier: number;
+  type: string;
+  /** Wallet balance right after this round's credit. */
+  balance: number;
+  /** CloseComplex.finalState - the math rebuilds the close ops from it. */
+  finalState?: RoundState;
+  mathVersion?: string;
+}
+
 export interface SettleSimple {
   sessionId: string;
   /** Final bet in currency's minimal unit (integer).
@@ -548,11 +593,18 @@ export interface OpenComplex {
   bet: number;
   betIndex: number;
   priceMultiplier: number;
+  /** The mode the round is opened in. Spec 05 asks the wallet to persist it
+   *  so a resume on another process knows which math settles the round. */
+  modeId?: string;
   initialState: RoundState;
   mathVersion?: string;
   /** Promo pool id this round was consumed from, if any. */
   promoId?: string;
   idempotencyKey?: string;
+  /** Opaque fingerprint of the round's commercial terms (price and max-win
+   *  cap). The wallet persists it and returns it in WalletOpenRound.terms; a
+   *  process whose manifest prices the mode differently does not adopt it. */
+  terms?: string;
 }
 
 export interface UpdateComplex {
@@ -585,6 +637,15 @@ export interface CloseComplex {
    *  trigger reason for the wallet's audit trail (e.g. "session-closed",
    *  "idle-timeout"). Absent for a normal client-initiated close. */
   reason?: string;
+  /** Opaque token of the CLIENT request that closed the round (derived from
+   *  the client's idempotency key). Observational: wallets must leave it, like
+   *  `reason`, out of their idempotency fingerprint. A wallet implementing
+   *  `findSettledClose` durably maps it to the round this close settled -
+   *  whether this call credited it or replayed an earlier settlement of it
+   *  (e.g. an autoclose that got there first). A token already accepted for
+   *  ANOTHER round MUST be refused, rolling this close back: one client token
+   *  belongs to one round. */
+  requestKey?: string;
 }
 
 export interface RoundReceipt {
@@ -708,6 +769,11 @@ export interface PlatformAdapter {
   updateComplex?(req: UpdateComplex): Promise<void>;
   /** Close a complex round (credit win). */
   closeComplex(req: CloseComplex): Promise<RoundReceipt>;
+  /** Optional: the settled round a client CLOSE with this `requestKey` was
+   *  accepted for (see CloseComplex.requestKey). Lets a process that never saw
+   *  that close answer a client retrying it after a lost response - even if a
+   *  newer round is open by then - with no financial operation. */
+  findSettledClose?(sessionId: string, requestKey: string): Promise<WalletSettledRound | undefined>;
 
   /** Reverse an already-settled round (chargeback / reconciliation). Optional  -
    *  implement only if your upstream supports reversal. MUST undo money AND

@@ -1,0 +1,6 @@
+---
+"@open-rgs/contract": minor
+"@open-rgs/core": minor
+---
+
+Wallet-driven resume (ADR-007): the orchestrator adopts a complex round the wallet reports open on `openSession` (`SessionInfo.openRound: WalletOpenRound` with `state` + `mathVersion`), so a round opened before a restart or on another pod resumes and settles once. `OpenComplex.modeId` tells the wallet which mode to persist; `ComplexMath.resume(state)` (implemented by `withDeferredClose`) rebuilds the render ops. Adoption requires a known complex mode, the persisted state and the same math version; otherwise the round is left to the autoclose backstop. A promo-funded round is priced at its bet (the wallet returns `promoId`); a round is adopted only under the same commercial terms it was opened with (`OpenComplex.terms` / `WalletOpenRound.terms`: stake multiplier and max-win cap) and only when its outcome was fixed at open - a round awaiting a decision is never adopted. A CLOSE whose response was lost before a restart is answered - even while a newer round is open - from the wallet's durable token→round mapping (`CloseComplex.requestKey`, optional `PlatformAdapter.findSettledClose`, looked up before the current round is touched) without a second financial operation; `reason` and `requestKey` are observational and stay out of wallets' idempotency fingerprints.

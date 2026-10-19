@@ -121,7 +121,54 @@ render-degraded; same-pod resume keeps full fidelity.
 
 Until v1.7, adapters MAY omit all of this; the orchestrator treats an
 absent `openRound` as "nothing to resume" and
-`manifest.recovery.onRestart` applies. The autoclose backstop above is
+`manifest.recovery.onRestart` applies.
+
+**Orchestrator side (implemented).** `OpenComplex.modeId` tells the wallet
+which mode to persist. `SessionInfo.openRound` is a `WalletOpenRound`: the
+client-facing `OpenRoundResume` plus `state` (the initial state or last
+checkpoint) and `mathVersion` (from `OpenComplex.mathVersion`). On a fresh
+INIT the orchestrator adopts the round only when it can settle it faithfully:
+the mode exists and is complex, `state` is present and `mathVersion` equals the
+loaded math's version. The cost is recomputed as at open
+(`bet x stakeMultiplier`, or the bet alone for a promo-funded round, so a
+wallet MUST return `promoId` for such a round), and it equals the original
+price because the round must carry the same `terms` (`OpenComplex.terms`, an
+opaque fingerprint of the stake multiplier and max-win cap the round was opened
+under, persisted by the wallet and returned in `WalletOpenRound.terms`): the
+math version alone pins neither the price nor the cap. Only a round whose
+outcome was FIXED AT OPEN is adopted (the math's `resume` reports it awaits
+just the end-round action, as `withDeferredClose` does). A round still awaiting
+a decision is never adopted, even under mandatory audit: nothing recorded with
+the round proves its persisted state is the last step (the opener's checkpoint
+policy is unknown), and two processes adopting it could each accept a
+different decision. A fixed-at-open round has exactly one settlement, so
+concurrent adopters cannot diverge and the single-credit rule settles it once.
+Empty
+`ops` are rebuilt by the math's optional pure
+`ComplexMath.resume(state)` hook (`withDeferredClose` implements it from the
+parked outcome), so the resumed client renders the same spin. `state` is never
+forwarded to the client. A round that is not adopted is logged
+(`resume_not_adopted`) and left to the autoclose backstop.
+
+**Lost CLOSE response.** A client whose CLOSE response was lost retries with
+the same idempotency token. If the process that settled it died, its response
+cache died too. The orchestrator therefore sends `CloseComplex.requestKey` (a
+token derived from the client's), and a wallet implementing the optional
+`PlatformAdapter.findSettledClose(sessionId, requestKey)` durably maps it to
+the round that close was ACCEPTED for - whether it credited the round or
+replayed an earlier settlement of it (an autoclose that got there first); a
+token already accepted for another round is refused and that close rolled back,
+so one token never belongs to two rounds. A
+CLOSE carrying a token is looked up FIRST, before anything is done with the
+current round: a known token returns that round's original result (close ops
+rebuilt from its final state, recorded win, multiplier, type and balance) with
+no financial operation, even if a newer round is open by then; if the result
+cannot be rebuilt (another math version) the request fails and the open round
+is left alone. An unknown token proceeds as a normal close. The recovered
+response carries no `platformMaxWin` flag (the wallet record does not keep it).
+Like `reason`, `requestKey` is observational: wallets MUST leave both out of
+their idempotency fingerprint, so an autoclose repeating a committed client
+CLOSE replays instead of conflicting. The autoclose backstop above is
 **unchanged**, resume rescues the player who returns; the backstop
 settles the round of the player who never does.
 
