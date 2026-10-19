@@ -1188,9 +1188,20 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       throw translate(e, "CLOSE_FAILED");
     }
     if (!done) return undefined;
+    // The wallet settled this round, but this process may still hold it open -
+    // the settle committed and only its response was lost. Drop exactly that
+    // round (a newer one opened since stays open) and take the wallet's balance.
+    const settledHere = s.openRound?.roundId === done.roundId;
+    const forgetSettled = (close?: CloseOutcome) => {
+      if (!settledHere || s.openRound?.roundId !== done.roundId) return;
+      sessions.setBalance(s.sessionId, done.balance);
+      if (close) sessions.setCarry(s.sessionId, close.carry, close.nextMode);
+      s.openRound = undefined;
+    };
     // The token IS known: from here on it must never fall through to a normal
     // close (that would settle whatever round is open now with an old token).
     const unrecoverable = (why: string): never => {
+      forgetSettled();
       throw new RGSError("CLOSE_FAILED", `That close was already settled (round ${done.roundId}) but its result cannot be rebuilt here: ${why}`);
     };
     const mode = manifest.modes[done.modeId];
@@ -1204,6 +1215,14 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     }
     // the recorded settlement is authoritative; a capped round carries its cap op
     const ops = done.type === "max_win_reached" ? applyMaxWinCapClose(close, 0, done.multiplier).ops : close.ops;
+    if (settledHere) {
+      recordAudit(mode, {
+        sessionId: s.sessionId, roundId: done.roundId, kind: "close",
+        type: done.type, bet: s.openRound!.bet, win: done.win, multiplier: done.multiplier, reason: "",
+        outcomeStatus: done.type === "max_win_reached" ? "settled-max-win" : "settled",
+      });
+    }
+    forgetSettled(close);
     log.info("Lost CLOSE response recovered from the wallet", {
       "event.category": "orchestrator", "event.action": "close_recovered",
       "session.id": s.sessionId, "round.id": done.roundId,

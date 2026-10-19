@@ -40,6 +40,8 @@ class DurableWallet implements PlatformAdapter {
   promo: { id: string; bet: number; remaining: number; modeFilter?: string[] } | undefined;
   /** Whether this wallet keeps the state current through updateComplex. */
   checkpoints = false;
+  /** The next closeComplex commits, then its response is lost. */
+  loseNextCloseResponse = false;
   updateComplex?: (req: { sessionId: string; roundId: string; state: string }) => Promise<void>;
   constructor() {
     this.updateComplex = async (req) => {
@@ -98,6 +100,7 @@ class DurableWallet implements PlatformAdapter {
       ...(req.mathVersion ? { mathVersion: req.mathVersion } : {}),
     });
     if (req.requestKey) this.requestRounds.set(`${req.sessionId}|${req.requestKey}`, req.roundId);
+    if (this.loseNextCloseResponse) { this.loseNextCloseResponse = false; throw new Error("socket hang up"); }
     return { roundId: req.roundId, balance: this.balance };
   }
   async findSettledClose(sessionId: string, requestKey: string): Promise<WalletSettledRound | undefined> {
@@ -398,5 +401,35 @@ describe("adoption safety (security review)", () => {
     await expect(p2.orch.closeRound({ idempotencyKey: "close-A" }, p2.conn)).rejects.toThrow(/already settled/);
     expect(wallet.open.get("wr-s18")?.roundId).toBe(b.roundId);
     expect(wallet.credits).toEqual([a.win]);
+  });
+  test("a CLOSE settled by the wallet but whose response was lost leaves no stale round in the same process", async () => {
+    const wallet = new DurableWallet();
+    const p1 = runtime(wallet, withDeferredClose(simple()));
+    await p1.orch.init({ sid: "wr-s19" }, p1.conn);
+    const opened = await p1.orch.openRound({ mode: "buy" }, p1.conn);
+    wallet.loseNextCloseResponse = true;
+    await expect(p1.orch.closeRound({ idempotencyKey: "close-L" }, p1.conn)).rejects.toThrow();
+    expect(wallet.open.has("wr-s19")).toBe(false); // the wallet settled it
+    const retried = await p1.orch.closeRound({ idempotencyKey: "close-L" }, p1.conn);
+    expect(retried.roundId).toBe(opened.roundId);
+    expect(retried.balance).toBe(wallet.balance);
+    expect(wallet.credits).toEqual([retried.win]);
+    // the session plays on: no ROUND_ALREADY_OPEN, and a reconnect shows no resume
+    const reconnect = await p1.orch.init({ sid: "wr-s19" }, p1.conn);
+    expect(reconnect.resume).toBeUndefined();
+    const next = await p1.orch.openRound({ mode: "buy" }, p1.conn);
+    expect(next.roundId).not.toBe(opened.roundId);
+  });
+
+  test("recovering an old CLOSE keeps a newer round this process holds open", async () => {
+    const wallet = new DurableWallet();
+    const p1 = runtime(wallet, withDeferredClose(simple()));
+    await p1.orch.init({ sid: "wr-s20" }, p1.conn);
+    await p1.orch.openRound({ mode: "buy" }, p1.conn);
+    const a = await p1.orch.closeRound({ idempotencyKey: "close-A" }, p1.conn);
+    const b = await p1.orch.openRound({ mode: "buy" }, p1.conn);
+    expect(await p1.orch.closeRound({ idempotencyKey: "close-A" }, p1.conn)).toEqual(a);
+    const closedB = await p1.orch.closeRound({ idempotencyKey: "close-B" }, p1.conn);
+    expect(closedB.roundId).toBe(b.roundId);
   });
 });
