@@ -84,6 +84,7 @@ import BaseLayout from "../layouts/BaseLayout.astro";
 
     <pre><code>{`SettleSimple = {
   sessionId, bet, betIndex, priceMultiplier, win, multiplier, type,
+                         // bet = the ladder rung; debit = bet x priceMultiplier
   roundState,            // this round's final math state, also the carry
   nextMode?, mathVersion?, promoId?, idempotencyKey?,
 }

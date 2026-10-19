@@ -9,6 +9,12 @@ import type { PlatformAdapter, PlatformEvent, SessionInfo, SettleSimple, OpenCom
 import { MockPlatform } from "@open-rgs/platform-mock";
 import { runConformance, mdConformanceReport } from "../src/index.js";
 
+/** Spec 05 "Round price": the debit is bet x priceMultiplier. */
+function priced(bet: number, priceMultiplier: number): number {
+  if (!Number.isFinite(priceMultiplier) || priceMultiplier < 0) throw new Error("InvalidAmount: priceMultiplier");
+  return bet * priceMultiplier;
+}
+
 // A genuinely SAFE reference adapter: dedupes idempotency keys, rejects
 // overspend / unknown session / bad round id. The conformance kit now has
 // teeth (H13), so "known-good" must actually be good.
@@ -56,8 +62,9 @@ class TinyAdapter implements PlatformAdapter {
     const dup = this.replay(req.idempotencyKey);
     if (dup) return dup;
     const bal = this.mustBalance(req.sessionId);
-    if (req.bet > bal) throw new Error("InsufficientFunds");
-    const next = bal - req.bet + req.win;
+    const cost = priced(req.bet, req.priceMultiplier);
+    if (cost > bal) throw new Error("InsufficientFunds");
+    const next = bal - cost + req.win;
     this.balances.set(req.sessionId, next);
     const roundId = `r-${this.nextRoundId++}`;
     // Carry and money commit together - one round, one record.
@@ -73,8 +80,9 @@ class TinyAdapter implements PlatformAdapter {
     const dup = this.replay(req.idempotencyKey);
     if (dup) return dup;
     const bal = this.mustBalance(req.sessionId);
-    if (req.bet > bal) throw new Error("InsufficientFunds");
-    const next = bal - req.bet;
+    const cost = priced(req.bet, req.priceMultiplier);
+    if (cost > bal) throw new Error("InsufficientFunds");
+    const next = bal - cost;
     this.balances.set(req.sessionId, next);
     const roundId = `r-${this.nextRoundId++}`;
     this.openRoundId = roundId;
@@ -170,8 +178,9 @@ class RacyAdapter implements PlatformAdapter {
     await new Promise(r => setTimeout(r, 1));
     const bal = this.balances.get(req.sessionId);
     if (bal === undefined) throw new Error(`SessionInvalid: ${req.sessionId}`);
-    if (req.bet > bal) throw new Error("InsufficientFunds");
-    const next = bal - req.bet + req.win;
+    const cost = priced(req.bet, req.priceMultiplier);
+    if (cost > bal) throw new Error("InsufficientFunds");
+    const next = bal - cost + req.win;
     this.balances.set(req.sessionId, next);
     const receipt: RoundReceipt = { roundId: `r-${this.n++}`, balance: next };
     if (key !== undefined) this.receipts.set(key, receipt);

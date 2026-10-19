@@ -21,8 +21,8 @@ class MiniPlatform implements PlatformAdapter {
   async openSession(sessionId: string): Promise<SessionInfo> {
     return { sessionId, currency: "USD", currencyDecimals: 2, balance: this.balance, allowedBets: [100], defaultBetIndex: 0 };
   }
-  async settleSimple(req: SettleSimple): Promise<RoundReceipt> { this.balance = this.balance - req.bet + req.win; return { roundId: `s${++this.seq}`, balance: this.balance }; }
-  async openComplex(req: OpenComplex): Promise<RoundReceipt> { this.balance -= req.bet; return { roundId: `r${++this.seq}`, balance: this.balance }; }
+  async settleSimple(req: SettleSimple): Promise<RoundReceipt> { this.balance = this.balance - req.bet * req.priceMultiplier + req.win; return { roundId: `s${++this.seq}`, balance: this.balance }; }
+  async openComplex(req: OpenComplex): Promise<RoundReceipt> { this.balance -= req.bet * req.priceMultiplier; return { roundId: `r${++this.seq}`, balance: this.balance }; }
   async closeComplex(req: CloseComplex): Promise<RoundReceipt> { this.balance += req.win; return { roundId: req.roundId, balance: this.balance }; }
   onEvent(_h: (e: PlatformEvent) => void) {}
 }
@@ -72,8 +72,9 @@ describe("priceMultiplier validation (M4)", () => {
   test("a valid integer priceMultiplier scales the bet", async () => {
     const { orch, conn } = setup();
     await orch.init({ sid: "m4m5-valid" }, conn);
-    const r = await orch.spin({ priceMultiplier: 2 }, conn); // bet 100 x 2 = 200
-    expect(r.bet).toBe(200);
+    const r = await orch.spin({ priceMultiplier: 2 }, conn); // cost 100 x 2 = 200
+    expect(r.bet).toBe(100);             // the ladder rung, never price-folded
+    expect(r.priceMultiplier).toBe(2);
     expect(r.win).toBe(200); // multiplier 1 x 200
   });
 });
@@ -160,10 +161,10 @@ describe("fractional stakeMultiplier  - stake rides on priceMultiplier, not bet"
     const { orch, platform, conn } = setupFracStake();
     await orch.init({ sid: "frac-compose" }, conn);
     // Client sends priceMultiplier=3 on an ante (stake 1.25)  - total
-    // priceMul x stake = 3.75. bet = base x 3 = 300 (integer).
+    // priceMul x stake = 3.75. bet stays the rung (100); cost = 100 x 3.75.
     const r = await orch.spin({ mode: "ante", priceMultiplier: 3 }, conn);
-    expect(r.bet).toBe(300);
-    expect(platform.lastBet).toBe(300);
+    expect(r.bet).toBe(100);
+    expect(platform.lastBet).toBe(100);
     expect(platform.lastPriceMultiplier).toBe(3.75);
     // win = 10 x (300 x 1.25) = 3750.
     expect(r.win).toBe(3750);

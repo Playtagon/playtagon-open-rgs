@@ -155,8 +155,9 @@ export async function runConformance(
     if (!Number.isFinite(receipt.balance) || !Number.isInteger(receipt.balance)) {
       throw new Error(`receipt.balance must be a finite integer minor unit: ${receipt.balance}`);
     }
-    if (receipt.balance !== before - fixture.bet) {
-      throw new Error(`balance ${receipt.balance} != expected ${before - fixture.bet}`);
+    const cost = fixture.bet * fixture.priceMultiplier;
+    if (receipt.balance !== before - cost) {
+      throw new Error(`balance ${receipt.balance} != expected ${before - cost} (bet x priceMultiplier)`);
     }
   });
 
@@ -176,9 +177,34 @@ export async function runConformance(
       idempotencyKey: "conf-win-1",
     };
     const r = await adapter.settleSimple(req);
-    const expected = before - fixture.bet + winAmount;
+    const expected = before - fixture.bet * fixture.priceMultiplier + winAmount;
     if (r.balance !== expected) {
       throw new Error(`balance ${r.balance} != expected ${expected}`);
+    }
+  });
+
+  // --- round price --------------------------------------------------
+  // Spec 05 "Round price": `bet` is the ladder rung and the debit is
+  // bet x priceMultiplier, where priceMultiplier already includes the client
+  // price (a table round's chip count, say). A wallet that also scales `bet`,
+  // or ignores priceMultiplier, charges the wrong amount on every such round.
+  await run("pricing.client-price", "simple-round", "a round with a client price debits bet x priceMultiplier exactly once", async () => {
+    const before = (await adapter.openSession(fixture.sessionId, fixture.connectionId)).balance;
+    const priceMultiplier = fixture.priceMultiplier * 3;
+    const r = await adapter.settleSimple({
+      sessionId: fixture.sessionId,
+      bet: fixture.bet,
+      betIndex: fixture.betIndex,
+      priceMultiplier,
+      win: 0, multiplier: 0, type: "loss", roundState: "",
+      idempotencyKey: "conf-price-3",
+    });
+    const expected = before - fixture.bet * priceMultiplier;
+    if (r.balance !== expected) {
+      throw new Error(
+        `balance ${r.balance} != expected ${expected}: cost must be bet x priceMultiplier ` +
+        `(${fixture.bet} x ${priceMultiplier}), not scaled twice or ignored`,
+      );
     }
   });
 
@@ -316,6 +342,19 @@ export async function runConformance(
       win: 0, multiplier: 0, type: "loss", roundState: "",
       idempotencyKey: "conf-overspend-1",
     }), "settle with bet > balance was accepted  - a wallet MUST reject overspend");
+  });
+
+  await run("errors.invalid-price", "errors", "a settle with a non-finite or negative priceMultiplier is rejected", async () => {
+    for (const [i, priceMultiplier] of [Number.NaN, Number.POSITIVE_INFINITY, -1].entries()) {
+      await expectReject(() => adapter.settleSimple({
+        sessionId: fixture.sessionId,
+        bet: fixture.bet,
+        betIndex: fixture.betIndex,
+        priceMultiplier,
+        win: 0, multiplier: 0, type: "loss", roundState: "",
+        idempotencyKey: `conf-bad-price-${i}`,
+      }), `settle with priceMultiplier=${priceMultiplier} was accepted  - the round has no valid cost`);
+    }
   });
 
   await run("errors.unknown-session", "errors", "a settle on an unopened session is rejected", async () => {

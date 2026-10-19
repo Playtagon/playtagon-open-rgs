@@ -89,6 +89,18 @@ function assertAmount(n: number, name: string): void {
   }
 }
 
+/** The round's debit: bet (the ladder rung) x priceMultiplier (client price x
+ *  mode stake), Spec 05 "Round price". A price that cannot produce a finite,
+ *  non-negative cost is refused before anything moves. */
+function roundCost(bet: number, priceMultiplier: number | undefined): number {
+  const p = priceMultiplier ?? 1;
+  const cost = bet * p;
+  if (typeof p !== "number" || !Number.isFinite(p) || p < 0 || !Number.isFinite(cost)) {
+    throw new Error(`InvalidAmount: priceMultiplier must be a finite non-negative number, got ${String(priceMultiplier)}`);
+  }
+  return cost;
+}
+
 export class MockPlatform implements PlatformAdapter {
   private state = new Map<string, MockState>();
   private handlers: ((e: PlatformEvent) => void)[] = [];
@@ -174,13 +186,12 @@ export class MockPlatform implements PlatformAdapter {
     if (isPromo) {
       this.assertPromo(s, req.promoId!);
     } else {
-      // Debit = bet x priceMultiplier. The orchestrator now keeps `bet`
-      // at base x clientPriceMul (integer minor units) and folds the
-      // mode's stakeMultiplier into `priceMultiplier` so it rides on the
-      // wire. A wallet with its own currency-precision handling recomputes
-      // the debit; our mock does the same so ante-style fractional debits +
-      // free-round (stake=0) modes both settle correctly.
-      const cost = req.bet * (req.priceMultiplier ?? 1);
+      // Debit = bet x priceMultiplier: `bet` is the bare ladder rung and the
+      // client price and the mode's stakeMultiplier both ride on
+      // `priceMultiplier`. A wallet with its own currency-precision handling
+      // recomputes the debit; our mock does the same so ante-style fractional
+      // debits + free-round (stake=0) modes both settle correctly.
+      const cost = roundCost(req.bet, req.priceMultiplier);
       if (cost > s.balance) throw new Error("InsufficientFunds");
       s.balance -= cost;
     }
@@ -214,9 +225,8 @@ export class MockPlatform implements PlatformAdapter {
     if (isPromo) {
       this.assertPromo(s, req.promoId!);
     } else {
-      // See settleSimple, debit = bet x priceMultiplier under the new
-      // stake-on-priceMul semantics.
-      const cost = req.bet * (req.priceMultiplier ?? 1);
+      // See settleSimple: debit = bet x priceMultiplier.
+      const cost = roundCost(req.bet, req.priceMultiplier);
       if (cost > s.balance) throw new Error("InsufficientFunds");
       s.balance -= cost;
     }
