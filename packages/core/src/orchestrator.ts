@@ -279,6 +279,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         s.balanceSeq = e.seq;
       }
       sessions.setBalance(e.sessionId, e.balance);
+      if (s) s.balanceEvents = (s.balanceEvents ?? 0) + 1;
     } else if (e.type === "sessionClosed") {
       // If the session has an in-flight round, autoclose it first so
       // money settles cleanly before we drop the local cache.
@@ -1108,6 +1109,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     );
     const win = settleAmount(cappedClose.multiplier, open.effectiveCost);
     assertFundedWin(open.effectiveCost, cappedClose.multiplier);
+    open.closeBalanceEvents = s.balanceEvents ?? 0;
     let receipt;
     try {
       receipt = await timedPlatformCall(metrics, "closeComplex", () => platform.closeComplex({
@@ -1190,11 +1192,14 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     if (!done) return undefined;
     // The wallet settled this round, but this process may still hold it open -
     // the settle committed and only its response was lost. Drop exactly that
-    // round (a newer one opened since stays open) and take the wallet's balance.
+    // round (a newer one opened since stays open). done.balance is the balance
+    // right after that credit: it only replaces the session's when no wallet
+    // balance event arrived since the CLOSE was sent - a later one is fresher.
     const settledHere = s.openRound?.roundId === done.roundId;
     const forgetSettled = (close?: CloseOutcome) => {
-      if (!settledHere || s.openRound?.roundId !== done.roundId) return;
-      sessions.setBalance(s.sessionId, done.balance);
+      const open = s.openRound;
+      if (!settledHere || open?.roundId !== done.roundId) return;
+      if ((open.closeBalanceEvents ?? 0) === (s.balanceEvents ?? 0)) sessions.setBalance(s.sessionId, done.balance);
       if (close) sessions.setCarry(s.sessionId, close.carry, close.nextMode);
       s.openRound = undefined;
     };
@@ -1338,6 +1343,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     );
     const win = settleAmount(cappedClose.multiplier, open.effectiveCost);
     assertFundedWin(open.effectiveCost, cappedClose.multiplier);
+    open.closeBalanceEvents = s.balanceEvents ?? 0;
     let receipt;
     try {
       receipt = await timedPlatformCall(metrics, "closeComplex", () => platform.closeComplex({

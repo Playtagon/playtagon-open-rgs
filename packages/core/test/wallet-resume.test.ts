@@ -11,7 +11,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createOrchestrator } from "../src/index.js";
 import { withDeferredClose } from "../src/deferred-close.js";
-import { remove as forgetSession } from "../src/session.js";
+import { remove as forgetSession, get as sessionOf } from "../src/session.js";
 import { deriveIdempotencyKey } from "../src/idempotency.js";
 import {
   defineGame,
@@ -107,7 +107,8 @@ class DurableWallet implements PlatformAdapter {
     const roundId = this.requestRounds.get(`${sessionId}|${requestKey}`);
     return roundId ? this.settled.get(roundId) : undefined;
   }
-  onEvent(_h: (e: PlatformEvent) => void) {}
+  handler: ((e: PlatformEvent) => void) | undefined;
+  onEvent(h: (e: PlatformEvent) => void) { this.handler = h; }
 }
 
 /** Deterministic outcome per draw so a re-run math could never coincide by luck. */
@@ -414,6 +415,7 @@ describe("adoption safety (security review)", () => {
     expect(retried.roundId).toBe(opened.roundId);
     expect(retried.balance).toBe(wallet.balance);
     expect(wallet.credits).toEqual([retried.win]);
+    expect(sessionOf("wr-s19")!.balance).toBe(wallet.balance);
     // the session plays on: no ROUND_ALREADY_OPEN, and a reconnect shows no resume
     const reconnect = await p1.orch.init({ sid: "wr-s19" }, p1.conn);
     expect(reconnect.resume).toBeUndefined();
@@ -431,5 +433,20 @@ describe("adoption safety (security review)", () => {
     expect(await p1.orch.closeRound({ idempotencyKey: "close-A" }, p1.conn)).toEqual(a);
     const closedB = await p1.orch.closeRound({ idempotencyKey: "close-B" }, p1.conn);
     expect(closedB.roundId).toBe(b.roundId);
+  });
+  test("a recovered CLOSE does not overwrite a fresher balance the wallet reported meanwhile", async () => {
+    const wallet = new DurableWallet();
+    const p1 = runtime(wallet, withDeferredClose(simple()));
+    await p1.orch.init({ sid: "wr-s1" }, p1.conn);
+    await p1.orch.openRound({ mode: "buy" }, p1.conn);
+    wallet.loseNextCloseResponse = true;
+    await expect(p1.orch.closeRound({ idempotencyKey: "close-D" }, p1.conn)).rejects.toThrow();
+    const settled = wallet.balance;
+    wallet.balance += 1000; // a deposit lands before the retry
+    wallet.handler!({ type: "balanceChanged", sessionId: "wr-s1", balance: wallet.balance, reason: "deposit", seq: 1 });
+    const retried = await p1.orch.closeRound({ idempotencyKey: "close-D" }, p1.conn);
+    expect(retried.balance).toBe(settled); // the idempotent answer is the settlement's
+    expect(sessionOf("wr-s1")!.balance).toBe(settled + 1000); // the session keeps the fresher one
+    expect(sessionOf("wr-s1")!.openRound).toBeUndefined();
   });
 });

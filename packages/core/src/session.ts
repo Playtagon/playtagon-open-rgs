@@ -55,6 +55,9 @@ export interface OpenRound {
    *  Threaded to the close so financial metrics label wins by the funding
    *  of the round that produced them. */
   promoId?: string;
+  /** LocalSession.balanceEvents when this process sent the round's CLOSE: a
+   *  recovered settlement only restores its balance if none arrived since. */
+  closeBalanceEvents?: number;
 }
 
 export interface LocalSession {
@@ -83,6 +86,8 @@ export interface LocalSession {
   /** Highest balanceChanged event seq applied (see PlatformEvent.seq). Used
    *  to drop out-of-order/duplicate balance events. */
   balanceSeq?: number;
+  /** How many balanceChanged events were applied to this session. */
+  balanceEvents?: number;
   readonly createdAt: number;
 }
 
