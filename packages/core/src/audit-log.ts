@@ -33,6 +33,8 @@ export const AUDIT_GENESIS_HASH = "0".repeat(64);
  *  - `settled-max-win`: settled, but the win hit the max-win cap (Guarantee 7).
  *  - `failed-bet`  : the bet was declined / the open failed; NO money moved and
  *                     NO state was kept. This is No-Money-No-Honey, logged.
+ *  - `open-unknown`: authority OPEN failed to return; debit may have committed.
+ *                     Reconcile using the persisted wallet request and key.
  *  - `failed-win`  : the win credit failed after the bet was taken (a wallet
  *                     fault mid-round); flagged for reconciliation.
  *  - `autoclosed`  : the round was closed by an external autoclose trigger.
@@ -42,6 +44,7 @@ export type RoundOutcomeStatus =
   | "settled"
   | "settled-max-win"
   | "failed-bet"
+  | "open-unknown"
   | "failed-win"
   | "autoclosed"
   | "rejected";

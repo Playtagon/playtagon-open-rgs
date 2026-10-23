@@ -1014,6 +1014,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     metrics?.mathDuration.observe((performance.now() - mathStart) / 1000, { kind: "complex", mode: requestedMode, phase: "open" });
 
     let receipt;
+    const openBalanceEvents = s.balanceEvents ?? 0;
     try {
       receipt = await timedPlatformCall(metrics, "openComplex", () => platform.openComplex({
         sessionId: s.sessionId,
@@ -1028,17 +1029,19 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         terms: roundTerms(mode, Boolean(betInfo.promoId), betInfo.clientPrice),
       }));
     } catch (e) {
-      // No-Money-No-Honey: the open's debit was declined -> no round opened, no
-      // state kept. Log the failed attempt rather than leaving a silent gap.
+      // An authority wallet may have committed before its response was lost.
+      // Its durable outbox must reconcile this; an exception is not proof of no debit.
       recordAudit(mode, {
         sessionId: s.sessionId, roundId: "", kind: "open",
         type: "open", bet: betInfo.bet, priceMultiplier: betInfo.priceMultiplier, win: 0, multiplier: 0, reason: "",
-        outcomeStatus: "failed-bet",
+        outcomeStatus: bound ? "open-unknown" : "failed-bet",
       });
       throw translate(e, "OPEN_FAILED");
     }
 
-    sessions.setBalance(s.sessionId, receipt.balance);
+    if (!bound || (s.balanceEvents ?? 0) === openBalanceEvents) {
+      sessions.setBalance(s.sessionId, receipt.balance);
+    }
     // A complex round consumes its promo round at OPEN - that is where it was
     // funded. The close only applies whatever the wallet reports afterwards.
     if (receipt.promo) promo.applyUpdate(s, receipt.promo);

@@ -20,6 +20,8 @@ Authority CLOSE uses a stable per-round request token and the existing wallet id
 
 `moneyRounding: 'floor-e8'` additionally requires an exact decimal-string `CloseOutcome.multiplierE8`, matching the display multiplier, positive integral stake multiplier and an E8-representable cap. Core clamps to the configured cap and computes `BigInt(stake) * E8 / 100000000`, then checks the money safe range. Existing modes retain half-even. A different rounding policy cannot adopt the open round.
 
+An authority OPEN exception is audited as `open-unknown`, not as proof that no debit happened. The host must keep its durable reservation until reconciliation. An OPEN receipt also cannot overwrite a newer `balanceChanged` event received while the request was in flight. A checkpoint restored through the authority API adopts the round without making another debit.
+
 The bounded OPEN response cache is a convenience, not durable admission. Beyond cache expiry/restart the room journal and wallet must recover uncertain OPENs by stable key. The embedding host must perform inquiry instead of treating a timeout as a failed debit, and it must not open a new bet while the old outcome is unknown.
 
 ## Not delivered by this slice

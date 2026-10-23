@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createOrchestrator } from "../src/orchestrator.js";
+import { createAuditLog, memoryAuditSink } from "../src/audit-log.js";
 import * as sessions from "../src/session.js";
 import { defineGame, type PlatformAdapter, type SessionInfo, type SettleSimple, type OpenComplex,
   type CloseComplex, type RoundReceipt, type ComplexMath, type ConnectionMeta, type PlatformEvent,
@@ -147,11 +148,12 @@ function setup(wallet = new DurableWallet(), sid = `authority-${++seq}`, floor =
     maxWinMultiplier: 1000, autoclose: { idleMs: 1000, policy: 'math-decides' },
     modes: { crash: { math, stakeMultiplier: 1, ...(floor ? { moneyRounding: 'floor-e8' as const } : {}), resolutionAuthority: 'room', recoveryMode: 'external-authority' } } });
   let api!: OrchestratorAuthorityAPI;
-  const orch = createOrchestrator({ manifest, platform: wallet, roundAuthority: resolver, onAuthorityAPI: a => { api = a; } });
+  const sink = memoryAuditSink();
+  const orch = createOrchestrator({ manifest, auditLog: createAuditLog(sink), platform: wallet, roundAuthority: resolver, onAuthorityAPI: a => { api = a; } });
   const conn: ConnectionMeta = { connectionId: sid, sessionId: null, demo: false };
   const open = () => api.openBoundRound({ internalSid: sid, modeId: 'crash', ladderIndex: 0, bindingId: 'binding', openKey: 'open-1' });
   const close = (roundId: string) => api.closeDecidedRound({ internalSid: sid, rgsRoundId: roundId, decisionId: 'decision' });
-  return { sid, wallet, api, orch, conn, manifest, resolver, open, close, decision,
+  return { sid, wallet, api, orch, conn, manifest, resolver, open, close, decision, sink,
     payout: (value: string) => { payoutE8 = value; }, ready: () => { ready = true; }, denyRestore: () => { restore = false; } };
 }
 
@@ -288,3 +290,33 @@ test('bad E8 outcome never credits the wallet', async () => {
   expect(x.wallet.credits).toEqual([]);
   expect(sessions.get(x.sid)?.openRound?.roundId).toBe(a.roundId);
 });
+
+test('authority OPEN receipt cannot overwrite a newer wallet balance event', async () => {
+  const x = setup();
+  const original = x.wallet.openComplex.bind(x.wallet);
+  x.wallet.openComplex = async req => {
+    const receipt = await original(req);
+    x.wallet.balance += 1000;
+    x.wallet.handler?.({ type: 'balanceChanged', sessionId: x.sid, balance: x.wallet.balance, reason: 'deposit', seq: 1 });
+    return receipt; // old post-debit balance, delayed behind the deposit event
+  };
+  await x.orch.init({ sid: x.sid }, x.conn);
+  await x.open();
+  expect(sessions.get(x.sid)?.balance).toBe(100900);
+});
+
+ test('lost authority OPEN response is unknown, and checkpoint restore does not debit again', async () => {
+  const x = setup();
+  const original = x.wallet.openComplex.bind(x.wallet);
+  x.wallet.openComplex = async req => { await original(req); throw new Error('lost response after commit'); };
+  await x.orch.init({ sid: x.sid }, x.conn);
+  await expect(x.open()).rejects.toMatchObject({ code: 'OPEN_FAILED' });
+  expect(x.wallet.balance).toBe(99900);
+  expect(x.sink.events.at(-1)?.outcomeStatus).toBe('open-unknown');
+  const roundId = x.wallet.open.get(x.sid)!.roundId;
+  sessions.remove(x.sid);
+  await x.api.restoreBoundRound({ internalSid: x.sid, rgsRoundId: roundId });
+  expect(sessions.get(x.sid)?.openRound?.roundId).toBe(roundId);
+  expect(sessions.get(x.sid)?.balance).toBe(99900);
+  expect(x.wallet.balance).toBe(99900);
+ });
