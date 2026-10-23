@@ -276,6 +276,38 @@ describe("the round is played as the engine plays it", () => {
     expect(a.positivePayouts.map(([m]) => m)).toEqual([1, 2, 3, 4]);
   });
 
+  test("a complex round that exhausts the step limit is a capability failure, not a sample", async () => {
+    // never terminal, always awaiting: the engine would refuse to close it
+    const endless: ComplexMath = {
+      kind: "complex", name: "endless", version: "1", rtp: 1,
+      open: () => ({ state: "s", ops: [], awaiting: { type: "go", options: [1] } }),
+      step: () => ({ state: "s", ops: [], awaiting: { type: "go", options: [1] } }),
+      isTerminal: () => false,
+      close: () => ({ multiplier: 7, ops: [], type: "x" }),
+    };
+    await expect(sampleMode(manifestOf(endless), "base", { rounds: 2, rng: xoshiro256ss(SEED), maxStepsPerRound: 1 }))
+      .rejects.toThrow(/step limit/);
+  });
+
+  test("a nonterminal complex round with no action to take is a capability failure", async () => {
+    const stuck: ComplexMath = {
+      kind: "complex", name: "stuck", version: "1", rtp: 1,
+      open: () => ({ state: "s", ops: [] }),
+      step: () => ({ state: "s", ops: [] }),
+      isTerminal: () => false,
+      close: () => ({ multiplier: 7, ops: [], type: "x" }),
+    };
+    await expect(sampleMode(manifestOf(stuck), "base", { rounds: 2, rng: xoshiro256ss(SEED) }))
+      .rejects.toThrow(/not terminal/);
+  });
+
+  test("maxStepsPerRound must be a positive safe integer", async () => {
+    const m = manifestOf(seqMath([1]));
+    for (const bad of [0, -1, 1.5, NaN, Infinity]) {
+      await expect(sampleMode(m, "base", { rounds: 1, rng: xoshiro256ss(SEED), maxStepsPerRound: bad })).rejects.toThrow(/maxStepsPerRound/);
+    }
+  });
+
   test("bad arguments are rejected", async () => {
     const rng = xoshiro256ss(SEED);
     const m = manifestOf(seqMath([1]));

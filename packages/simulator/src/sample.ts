@@ -65,7 +65,8 @@ export interface SampleOptions {
   observe?: (ops: readonly unknown[]) => Record<string, boolean>;
   /** Complex rounds only: how to choose actions. Default "first". */
   complexStrategy?: ComplexStrategy;
-  /** Complex rounds only: step safety cap. Default 1000. */
+  /** Complex rounds only: step safety cap (positive integer). Default 1000.
+   *  A round still nonterminal at the cap throws. */
   maxStepsPerRound?: number;
 }
 
@@ -138,6 +139,9 @@ export async function sampleMode(
   };
   const strategy = options.complexStrategy ?? "first";
   const maxSteps = options.maxStepsPerRound ?? 1000;
+  if (!Number.isSafeInteger(maxSteps) || maxSteps < 1) {
+    throw new Error(`sampleMode: maxStepsPerRound must be a positive safe integer, got ${maxSteps}`);
+  }
 
   let count = 0, mean = 0, m2 = 0;
   let hits = 0, capClipped = 0, capReached = 0, maxMultiplier = 0;
@@ -265,8 +269,15 @@ async function playComplex(
   let lastOps: Op[] = open.ops;
   const ops: Op[] = keepOps ? [...open.ops] : [];
   let steps = 0;
-  while (steps < maxSteps && !(await Promise.resolve(math.isTerminal(state)))) {
-    if (!awaiting) break;
+  // The engine refuses to close a nonterminal round (INVALID_ROUND), so an
+  // unfinished round is a math capability failure, never a sample.
+  while (!(await Promise.resolve(math.isTerminal(state)))) {
+    if (!awaiting) {
+      throw new Error(`sampleMode: complex round in mode '${ctx.mode}' is not terminal and awaits no action`);
+    }
+    if (steps >= maxSteps) {
+      throw new Error(`sampleMode: complex round in mode '${ctx.mode}' hit the step limit (${maxSteps}) without becoming terminal`);
+    }
     const action = pickAction(awaiting, lastOps, steps, strategy, rng);
     const step = await Promise.resolve(math.step(state, action));
     state = step.state;
