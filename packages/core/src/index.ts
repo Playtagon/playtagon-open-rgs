@@ -8,7 +8,7 @@ export {
   // reconciliation script - can call it rather than reimplement it.
   applyMaxWinCap, applyMaxWinCapClose,
 } from "./orchestrator.js";
-export { settleAmount, roundHalfEven } from "./money.js";
+export { settleAmount, settleFloorE8, roundHalfEven } from "./money.js";
 export { deriveIdempotencyKey, uuidV4 } from "./idempotency.js";
 export { createRequestCache, type RequestCache, type RequestCacheOptions } from "./request-cache.js";
 export { OPAQUE_ERROR_CODES, isOpaque, clientMessage } from "./error-policy.js";

@@ -32,10 +32,13 @@ import {
   type CheatHint,
   type RoundOutcome,
   type CloseOutcome,
+  type RoundAuthority,
+  type OrchestratorAuthorityAPI,
+  type AuthorityResolutionContext,
 } from "@open-rgs/contract";
 import * as sessions from "./session.js";
 import * as promo from "./promo.js";
-import { settleAmount } from "./money.js";
+import { settleAmount, settleFloorE8, assertSafeAmount } from "./money.js";
 import { deriveIdempotencyKey } from "./idempotency.js";
 import { createRequestCache, type RequestCacheOptions } from "./request-cache.js";
 import type { AuditLog, AuditInput } from "./audit-log.js";
@@ -50,6 +53,8 @@ import type { IdempotencyConfig, ConcurrencyPolicy, WalletOpenRound } from "@ope
 import type { OpenRound } from "./session.js";
 
 export interface OrchestratorConfig {
+  roundAuthority?: RoundAuthority;
+  onAuthorityAPI?: (api: OrchestratorAuthorityAPI) => void;
   manifest: GameManifest;
   platform: PlatformAdapter;
   /** @deprecated No longer used by the orchestrator, cheats are gated by
@@ -166,6 +171,24 @@ function errorReason(msg: string): string {
 
 export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
   const { manifest, platform, metrics } = cfg;
+  for (const mode of Object.values(manifest.modes)) {
+    if (mode.moneyRounding === "floor-e8" && (!mode.resolutionAuthority || !Number.isSafeInteger(mode.stakeMultiplier) || mode.stakeMultiplier <= 0)) {
+      throw new RGSError("INVALID_MODE", "floor-e8 requires an authority mode with a positive integer stake multiplier");
+    }
+    if (mode.moneyRounding === "floor-e8") {
+      const cap = mode.maxWinMultiplier ?? manifest.maxWinMultiplier;
+      if (cap === undefined || cap <= 0 || !Number.isSafeInteger(cap * 100_000_000)) {
+        throw new RGSError("INVALID_MODE", "floor-e8 requires a positive E8-representable max-win cap");
+      }
+    }
+    if (mode.resolutionAuthority || mode.recoveryMode === "external-authority") {
+      if (!mode.resolutionAuthority || mode.recoveryMode !== "external-authority" ||
+          mode.math.kind !== "complex" || mode.math.authorityVersion !== 1 || !mode.math.resume || !cfg.roundAuthority || !platform.findSettledClose ||
+          manifest.autoclose?.policy !== "math-decides") {
+        throw new RGSError("INVALID_MODE", "Authority mode requires a resolver, authority-capable complex resume, wallet settled lookup, external-authority recovery and math-decides policy");
+      }
+    }
+  }
   const cheatsEnabled = cfg.cheatsEnabled ?? false;
   const auditLog = cfg.auditLog;
   const auditMode = cfg.auditMode ?? "best-effort";
@@ -682,7 +705,9 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
    */
   function roundTerms(mode: GameMode, promoFunded: boolean, clientPrice: number): string {
     const cap = mode.maxWinMultiplier ?? manifest.maxWinMultiplier;
-    return `v2;stake=${promoFunded ? "promo" : mode.stakeMultiplier};cap=${cap ?? "none"};cp=${clientPrice}`;
+    const authority = mode.resolutionAuthority
+      ? `;authority=${encodeURIComponent(mode.resolutionAuthority)};recovery=external-authority;rounding=${mode.moneyRounding ?? "half-even"}` : "";
+    return `v2;stake=${promoFunded ? "promo" : mode.stakeMultiplier};cap=${cap ?? "none"}${authority};cp=${clientPrice}`;
   }
 
   function legacyTerms(mode: GameMode, promoFunded: boolean): string {
@@ -695,7 +720,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     mode: GameMode, r: WalletOpenRound,
   ): { priceMultiplier?: number; effectiveCost: number } | string {
     const promoFunded = Boolean(r.promoId);
-    if (r.terms !== undefined && r.terms === legacyTerms(mode, promoFunded)) {
+    if (!mode.resolutionAuthority && r.terms !== undefined && r.terms === legacyTerms(mode, promoFunded)) {
       // v1: the opener sent bet = rung x clientPrice, so its cost was
       // bet x stake. Kept exactly, a restart must not reprice an old round.
       return { effectiveCost: promoFunded ? r.bet : r.bet * mode.stakeMultiplier };
@@ -734,6 +759,9 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
   async function adoptWalletOpenRound(sessionId: string, r: WalletOpenRound | undefined): Promise<OpenRound | undefined> {
     if (!r) return undefined;
     const skip = (reason: string): undefined => {
+      if (manifest.modes[r.modeId]?.resolutionAuthority) {
+        throw new RGSError("AUTHORITY_NOT_READY", "Authority round cannot be restored yet");
+      }
       log.warn("Wallet reports an open round this process cannot adopt", {
         "event.category": "orchestrator", "event.action": "resume_not_adopted",
         "session.id": sessionId, "round.id": r.roundId, "round.mode": r.modeId, reason,
@@ -760,6 +788,12 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       } catch (e) {
         return skip(`math could not rebuild the round: ${e instanceof Error ? e.message : String(e)}`);
       }
+    }
+    if (mode.resolutionAuthority) {
+      if (!await cfg.roundAuthority!.authorizeRestore({ authorityId: mode.resolutionAuthority, internalSid: sessionId, checkpoint: r })) {
+        return skip("binding not authorized by authority");
+      }
+      fixedAtOpen = true; // authority validated the live binding, not a fixed outcome
     }
     if (!fixedAtOpen) return skip("the round still awaits a decision; its persisted state may not be the last step");
     const pricing = pricingFromTerms(mode, r);
@@ -930,7 +964,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
 
   // --- COMPLEX OPEN -------------------------------------------------------
 
-  async function openRound(req: ClientRequestOpenRound, conn: ConnectionMeta): Promise<ClientResponseOpenRound> {
+  async function openRound(req: ClientRequestOpenRound, conn: ConnectionMeta, bound?: { bindingId: string }): Promise<ClientResponseOpenRound> {
     const s = sessionOrThrow(req.sid ?? conn.sessionId);
     if (s.openRound) throw new RGSError("ROUND_ALREADY_OPEN", "Close current round first");
 
@@ -940,6 +974,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       throw new RGSError("INVALID_MODE", `Mode '${requestedMode}' is simple; use spin instead`);
     }
 
+    if (Boolean(mode.resolutionAuthority) !== Boolean(bound)) throw new RGSError("AUTHORITY_REQUIRED", "Use the private authority API for this mode");
     const betInfo = computeBet(s, mode, requestedMode, req.betIndex, req.priceMultiplier);
     if (!betInfo.promoId && betInfo.effectiveCost > s.balance) {
       recordAudit(mode, {
@@ -960,6 +995,19 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       req.params?.["cheat"] as Record<string, unknown> | undefined,
       req.params,
     );
+    if (bound) {
+      if (mode.moneyRounding === "floor-e8") assertSafeAmount(betInfo.effectiveCost, "cost");
+      if (betInfo.promoId) throw new RGSError("INVALID_BET", "Authority rounds do not support promo funding yet");
+      ctx.authority = await cfg.roundAuthority!.resolveOpen({
+        authorityId: mode.resolutionAuthority!, bindingId: bound.bindingId,
+        internalSid: s.sessionId, modeId: requestedMode,
+        bet: betInfo.bet, betIndex: betInfo.betIndex, priceMultiplier: betInfo.priceMultiplier,
+        operationKey: req.idempotencyKey!,
+      });
+      if (ctx.authority.authorityId !== mode.resolutionAuthority || ctx.authority.bindingId !== bound.bindingId) {
+        throw new RGSError("INVALID_ROUND", "Authority returned a different binding");
+      }
+    }
     const math = mode.math as ComplexMath;
     const mathStart = performance.now();
     const open = await Promise.resolve(math.open(s.carry, ctx));
@@ -1037,6 +1085,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     }
 
     const mode = modeOrThrow(open.modeId);
+    if (mode.resolutionAuthority) throw new RGSError("AUTHORITY_REQUIRED", "Authority rounds do not accept client steps");
     const math = mode.math as ComplexMath;
 
     let stepResult;
@@ -1087,20 +1136,23 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
 
   // --- COMPLEX CLOSE ------------------------------------------------------
 
-  async function closeRound(req: ClientRequestCloseRound, conn: ConnectionMeta): Promise<ClientResponseCloseRound> {
+  async function closeRound(req: ClientRequestCloseRound, conn: ConnectionMeta, trusted?: { roundId: string; decisionId?: string; autoclose?: boolean }): Promise<ClientResponseCloseRound> {
     const s = sessionOrThrow(req.sid ?? conn.sessionId);
     // A retried CLOSE is matched to the round it closed BEFORE anything is done
     // with the current round: after a restart a newer round may be open, and the
     // old token must not settle it.
-    const recovered = await recoverSettledClose(s, req);
+    const recovered = await recoverSettledClose(s, req, trusted);
     if (recovered) return recovered;
     const open = s.openRound;
     if (!open) throw new RGSError("NO_ROUND_OPEN", "No round in progress");
 
     const mode = modeOrThrow(open.modeId);
+    if (Boolean(mode.resolutionAuthority) !== Boolean(trusted)) throw new RGSError("AUTHORITY_REQUIRED", "Use the private authority API for this mode");
+    if (trusted && open.roundId !== trusted.roundId) throw new RGSError("INVALID_ROUND", "Authority round mismatch");
+    const decision = await decisionFor(mode, s.sessionId, open.roundId, open.state, trusted?.decisionId);
     const math = mode.math as ComplexMath;
 
-    if (!(await Promise.resolve(math.isTerminal(open.state)))) {
+    if (!(await Promise.resolve(math.isTerminal(open.state, decision)))) {
       throw new RGSError("INVALID_ROUND", "Round not terminal yet  - finish the flow first");
     }
 
@@ -1108,18 +1160,13 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     let closeResult;
     try {
       const mathStart = performance.now();
-      closeResult = await Promise.resolve(math.close(open.state));
+      closeResult = await Promise.resolve(trusted?.autoclose && decision?.kind === "crash_loss" && math.autoclose ? math.autoclose(open.state, decision) : math.close(open.state, decision));
       metrics?.mathDuration.observe((performance.now() - mathStart) / 1000, { kind: "complex", mode: open.modeId, phase: "close" });
     } catch (e) {
       throw translate(e, "CLOSE_FAILED");
     }
 
-    const cappedClose = applyMaxWinCapClose(
-      closeResult,
-      open.effectiveCost,
-      mode.maxWinMultiplier ?? manifest.maxWinMultiplier,
-    );
-    const win = settleAmount(cappedClose.multiplier, open.effectiveCost);
+    const { cappedClose, win } = closeMoney(mode, closeResult, open.effectiveCost);
     assertFundedWin(open.effectiveCost, cappedClose.multiplier);
     open.closeBalanceEvents = s.balanceEvents ?? 0;
     let receipt;
@@ -1127,7 +1174,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       receipt = await timedPlatformCall(metrics, "closeComplex", () => platform.closeComplex({
         sessionId: s.sessionId,
         roundId: open.roundId,
-        finalState: open.state,
+        finalState: cappedClose.finalState ?? open.state,
         win,
         multiplier: cappedClose.multiplier,
         type: cappedClose.type,
@@ -1193,7 +1240,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
    * persisted final state, with no financial operation - whatever round is
    * open now. A token the wallet does not know proceeds as a normal close.
    */
-  async function recoverSettledClose(s: sessions.LocalSession, req: ClientRequestCloseRound): Promise<ClientResponseCloseRound | undefined> {
+  async function recoverSettledClose(s: sessions.LocalSession, req: ClientRequestCloseRound, trusted?: { roundId: string; decisionId?: string }): Promise<ClientResponseCloseRound | undefined> {
     if (!req.idempotencyKey || typeof platform.findSettledClose !== "function") return undefined;
     let done;
     try {
@@ -1202,6 +1249,8 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       throw translate(e, "CLOSE_FAILED");
     }
     if (!done) return undefined;
+    if (Boolean(manifest.modes[done.modeId]?.resolutionAuthority) !== Boolean(trusted)) throw new RGSError("AUTHORITY_REQUIRED", "Use the private authority API for this round");
+    if (trusted && done.roundId !== trusted.roundId) throw new RGSError("INVALID_ROUND", "Settled authority round mismatch");
     // The wallet settled this round, but this process may still hold it open -
     // the settle committed and only its response was lost. Drop exactly that
     // round (a newer one opened since stays open). done.balance is the balance
@@ -1224,9 +1273,10 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     const mode = manifest.modes[done.modeId];
     if (!mode || mode.math.kind !== "complex" || done.finalState === undefined) return unrecoverable("unknown mode or no final state");
     if (!done.mathVersion || done.mathVersion !== mode.math.version) return unrecoverable("different math version");
+    const decision = await decisionFor(mode, s.sessionId, done.roundId, done.finalState, trusted?.decisionId);
     let close;
     try {
-      close = await Promise.resolve((mode.math as ComplexMath).close(done.finalState));
+      close = await Promise.resolve((mode.math as ComplexMath).close(done.finalState, decision));
     } catch (e) {
       return unrecoverable(e instanceof Error ? e.message : String(e));
     }
@@ -1299,6 +1349,15 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     if (!mode || mode.math.kind !== "complex") {
       return { closed: false, reason: "mode-not-complex" };
     }
+    if (mode.resolutionAuthority) {
+      try {
+        const closed = await closeRound({ sid: s.sessionId, idempotencyKey: authorityCloseKey(open.roundId) },
+          authorityConnection(s.sessionId), { roundId: open.roundId, autoclose: true });
+        return { closed: true, roundId: closed.roundId };
+      } catch {
+        return { closed: false, reason: "authority-settlement-pending" };
+      }
+    }
     const math = mode.math as ComplexMath;
 
     // The game-declared AutoclosePolicy decides what an abandoned round is
@@ -1348,12 +1407,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     // Autoclose moves money too, so it must run the same sanitize + cap
     // path as a client close, otherwise a non-finite/negative multiplier
     // from math.autoclose() (or a cap-exceeding one) would settle unguarded.
-    const cappedClose = applyMaxWinCapClose(
-      closeResult,
-      open.effectiveCost,
-      mode.maxWinMultiplier ?? manifest.maxWinMultiplier,
-    );
-    const win = settleAmount(cappedClose.multiplier, open.effectiveCost);
+    const { cappedClose, win } = closeMoney(mode, closeResult, open.effectiveCost);
     assertFundedWin(open.effectiveCost, cappedClose.multiplier);
     open.closeBalanceEvents = s.balanceEvents ?? 0;
     let receipt;
@@ -1361,7 +1415,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       receipt = await timedPlatformCall(metrics, "closeComplex", () => platform.closeComplex({
         sessionId: s.sessionId,
         roundId: open.roundId,
-        finalState: open.state,
+        finalState: cappedClose.finalState ?? open.state,
         win,
         multiplier: cappedClose.multiplier,
         type: cappedClose.type,
@@ -1465,6 +1519,80 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     // (eviction), not when a connection does.
     sessions.remove(conn.sessionId);
     syncSessionGauge();
+  }
+
+  function closeMoney(mode: GameMode, outcome: CloseOutcome, bet: number): { cappedClose: CloseOutcome; win: number } {
+    const cap = mode.maxWinMultiplier ?? manifest.maxWinMultiplier;
+    if (mode.moneyRounding !== "floor-e8") {
+      const cappedClose = applyMaxWinCapClose(outcome, bet, cap);
+      return { cappedClose, win: settleAmount(cappedClose.multiplier, bet) };
+    }
+    if (typeof outcome.multiplierE8 !== "string" || !/^(0|[1-9][0-9]{0,23})$/.test(outcome.multiplierE8)) {
+      throw new RGSError("INTERNAL_ERROR", "Authority math must provide an exact E8 multiplier");
+    }
+    let scaled = BigInt(outcome.multiplierE8);
+    if (scaled > BigInt(Number.MAX_SAFE_INTEGER) || outcome.multiplier !== Number(scaled) / 100_000_000) {
+      throw new RGSError("INTERNAL_ERROR", "Exact and display multipliers disagree");
+    }
+    const cappedClose = applyMaxWinCapClose(outcome, bet, cap);
+    if (cap !== undefined) {
+      const scaledCap = cap * 100_000_000;
+      if (!Number.isSafeInteger(scaledCap) || scaledCap < 0) throw new RGSError("INVALID_MODE", "Cap is not representable in E8");
+      if (scaled > BigInt(scaledCap)) scaled = BigInt(scaledCap);
+    }
+    return { cappedClose: { ...cappedClose, multiplierE8: scaled.toString() }, win: settleFloorE8(scaled.toString(), bet) };
+  }
+
+  function authorityConnection(sid: string): ConnectionMeta {
+    return { sessionId: sid, connectionId: `authority:${sid}`, demo: false };
+  }
+  function authorityCloseKey(roundId: string): string { return `authority-close:${roundId}`; }
+  async function decisionFor(mode: GameMode, sid: string, roundId: string, state: string, decisionId?: string): Promise<AuthorityResolutionContext | undefined> {
+    if (!mode.resolutionAuthority) return undefined;
+    const decision = await cfg.roundAuthority!.resolveDecision({
+      authorityId: mode.resolutionAuthority, internalSid: sid, rgsRoundId: roundId, state,
+      ...(decisionId !== undefined ? { decisionId } : {}),
+    });
+    if (!decision) throw new RGSError("AUTHORITY_NOT_READY", "Authority decision is not ready");
+    if (decision.authorityId !== mode.resolutionAuthority || (decisionId !== undefined && decision.decisionId !== decisionId)) {
+      throw new RGSError("INVALID_ROUND", "Authority decision mismatch");
+    }
+    return decision;
+  }
+  if (cfg.roundAuthority) {
+    // Convenience replay only. The host resolver/wallet still must durably
+    // bind operation keys to input across cache expiry and process restart.
+    const opens = createRequestCache();
+    const close = (input: { internalSid: string; rgsRoundId: string; decisionId: string }, autoclose: boolean) =>
+      runLocked(input.internalSid, () => {
+        if (!input.rgsRoundId || !input.decisionId) throw new RGSError("INVALID_FORMAT", "Round and decision IDs are required");
+        return closeRound({ sid: input.internalSid, idempotencyKey: authorityCloseKey(input.rgsRoundId) },
+          authorityConnection(input.internalSid), { roundId: input.rgsRoundId, decisionId: input.decisionId, autoclose });
+      });
+    cfg.onAuthorityAPI?.({
+      openBoundRound: input => runLocked(input.internalSid, async () => {
+        if (!input.bindingId || !input.openKey) throw new RGSError("INVALID_FORMAT", "Binding and stable open key are required");
+        const fingerprint = JSON.stringify([input.modeId, input.ladderIndex, input.bindingId]);
+        const cached = await opens.run(input.internalSid, input.openKey, async () => ({
+          fingerprint,
+          response: await openRound({ sid: input.internalSid, mode: input.modeId, betIndex: input.ladderIndex, idempotencyKey: input.openKey },
+            authorityConnection(input.internalSid), { bindingId: input.bindingId }),
+        }));
+        if (cached.fingerprint !== fingerprint) throw new RGSError("INVALID_FORMAT", "Open key reused with different input");
+        return cached.response;
+      }),
+      closeDecidedRound: input => close(input, false),
+      autocloseDecidedRound: input => close(input, true),
+      restoreBoundRound: input => runLocked(input.internalSid, async () => {
+        const current = sessions.get(input.internalSid)?.openRound;
+        if (current && current.roundId !== input.rgsRoundId) throw new RGSError("INVALID_ROUND", "Another round is already open");
+        await init({ sid: input.internalSid }, authorityConnection(input.internalSid));
+        const restored = sessions.get(input.internalSid)?.openRound;
+        if (!restored || restored.roundId !== input.rgsRoundId || !modeOrThrow(restored.modeId).resolutionAuthority) {
+          throw new RGSError("AUTHORITY_NOT_READY", "The expected authority round was not restored");
+        }
+      }),
+    });
   }
 
   // Serialize every client-facing operation per session (autocloseRound is
@@ -1593,6 +1721,7 @@ export function applyMaxWinCapClose(
     return multiplier === outcome.multiplier ? outcome : { ...outcome, multiplier };
   }
   return {
+    ...(outcome.finalState !== undefined ? { finalState: outcome.finalState } : {}),
     multiplier: maxMultiplier,
     ops: [...outcome.ops, { kind: "max_win", cap_multiplier: maxMultiplier, raw_multiplier: multiplier }],
     type: "max_win_reached",
