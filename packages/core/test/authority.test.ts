@@ -320,3 +320,18 @@ test('authority OPEN receipt cannot overwrite a newer wallet balance event', asy
   expect(sessions.get(x.sid)?.balance).toBe(99900);
   expect(x.wallet.balance).toBe(99900);
  });
+
+test('durable admission prepares exactly the same OPEN as the live private API',async()=>{
+ const {authorityOpenRequest}=await import('../src/authority-open.js');
+ const x=setup(undefined,undefined,true);await x.orch.init({sid:x.sid},x.conn);
+ const mode=x.manifest.modes.crash!;
+ const binding=await x.resolver.resolveOpen({authorityId:'room',bindingId:'binding',internalSid:x.sid,modeId:'crash',bet:100,betIndex:0,priceMultiplier:1,operationKey:'open-1'});
+ const opening=await (mode.math as ComplexMath).open(undefined,{mode:'crash',betIndex:0,priceMultiplier:1,authority:binding});
+ const prepared=authorityOpenRequest({mode,manifestCap:x.manifest.maxWinMultiplier,modeId:'crash',sessionId:x.sid,
+  bet:100,betIndex:0,priceMultiplier:1,clientPrice:1,openKey:'open-1',binding,opening});
+ expect(x.wallet.balance).toBe(100000);expect(x.wallet.open.size).toBe(0);
+ const original=x.wallet.openComplex.bind(x.wallet);let received:OpenComplex|undefined;
+ x.wallet.openComplex=async req=>{received=req;return original(req)};
+ await x.open();expect(received).toEqual(prepared);
+ expect(()=>authorityOpenRequest({mode,modeId:'crash',sessionId:x.sid,bet:100,betIndex:0,priceMultiplier:1,clientPrice:1,openKey:'',binding,opening})).toThrow();
+});

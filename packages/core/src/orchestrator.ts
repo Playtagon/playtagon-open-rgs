@@ -37,6 +37,7 @@ import {
   type AuthorityResolutionContext,
 } from "@open-rgs/contract";
 import * as sessions from "./session.js";
+import { authorityOpenRequest, encodeRoundTerms } from "./authority-open.js";
 import * as promo from "./promo.js";
 import { settleAmount, settleFloorE8, assertSafeAmount } from "./money.js";
 import { deriveIdempotencyKey } from "./idempotency.js";
@@ -704,10 +705,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
    * (bet = rung x cp); they are only ever read, never written (legacyTerms).
    */
   function roundTerms(mode: GameMode, promoFunded: boolean, clientPrice: number): string {
-    const cap = mode.maxWinMultiplier ?? manifest.maxWinMultiplier;
-    const authority = mode.resolutionAuthority
-      ? `;authority=${encodeURIComponent(mode.resolutionAuthority)};recovery=external-authority;rounding=${mode.moneyRounding ?? "half-even"}` : "";
-    return `v2;stake=${promoFunded ? "promo" : mode.stakeMultiplier};cap=${cap ?? "none"}${authority};cp=${clientPrice}`;
+    return encodeRoundTerms(mode, manifest.maxWinMultiplier, promoFunded, clientPrice);
   }
 
   function legacyTerms(mode: GameMode, promoFunded: boolean): string {
@@ -1016,7 +1014,11 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     let receipt;
     const openBalanceEvents = s.balanceEvents ?? 0;
     try {
-      receipt = await timedPlatformCall(metrics, "openComplex", () => platform.openComplex({
+      receipt = await timedPlatformCall(metrics, "openComplex", () => platform.openComplex(bound ? authorityOpenRequest({
+        mode,manifestCap:manifest.maxWinMultiplier,modeId:requestedMode,sessionId:s.sessionId,
+        bet:betInfo.bet,betIndex:betInfo.betIndex,priceMultiplier:betInfo.priceMultiplier,
+        clientPrice:betInfo.clientPrice,openKey:req.idempotencyKey!,binding:ctx.authority!,opening:open,
+      }) : {
         sessionId: s.sessionId,
         bet: betInfo.bet,
         betIndex: betInfo.betIndex,

@@ -36,3 +36,5 @@ export { Registry, DEFAULT_BUCKETS, type Counter, type Gauge, type Histogram } f
 export { createRgsMetrics, type RgsMetrics } from "./metrics-rgs.js";
 export * as session from "./session.js";
 export * as promo from "./promo.js";
+
+export { authorityOpenRequest } from './authority-open.js';
