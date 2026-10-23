@@ -285,14 +285,26 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       // money settles cleanly before we drop the local cache.
       const s = sessions.get(e.sessionId);
       if (s?.openRound) {
-        autocloseRound({
-          sessionId: e.sessionId,
-          roundId: s.openRound.roundId,
-          reason: `session-closed: ${e.reason}`,
+        const roundId = s.openRound.roundId;
+        // Keep settlement and eviction inside the same session lock. A held,
+        // NOT_READY or failed settlement still owns a debited round: dropping
+        // it here would destroy the only local recovery state. Never evict a
+        // different session/round that replaced the one this event targeted.
+        void runLocked(e.sessionId, async () => {
+          const result = await autocloseRoundImpl({
+            sessionId: e.sessionId,
+            roundId,
+            reason: `session-closed: ${e.reason}`,
+          });
+          if (result.closed && sessions.get(e.sessionId) === s && !s.openRound) {
+            sessions.remove(e.sessionId);
+            requestCache?.clearScope(e.sessionId);
+            syncSessionGauge();
+          }
         }).catch((err) => log.exception("autoclose-on-session-close failed", err, {
           "event.category": "orchestrator",
           "session.id": e.sessionId,
-        })).finally(() => { sessions.remove(e.sessionId); requestCache?.clearScope(e.sessionId); syncSessionGauge(); });
+        }));
       } else {
         sessions.remove(e.sessionId);
         requestCache?.clearScope(e.sessionId);
