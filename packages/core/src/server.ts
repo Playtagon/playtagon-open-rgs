@@ -22,6 +22,8 @@ import { CORE_VERSION } from "./version.js";
 import { createRgsMetrics, type RgsMetrics } from "./metrics-rgs.js";
 
 export interface ServerConfig {
+  roundAuthority?: import("@open-rgs/contract").RoundAuthority;
+  onAuthorityAPI?: (api: import("@open-rgs/contract").OrchestratorAuthorityAPI) => void;
   manifest: GameManifest;
   platform: PlatformAdapter;
   transport: ClientTransport;
@@ -308,6 +310,8 @@ export async function createServer(cfg: ServerConfig): Promise<ServerHandle> {
   }
 
   const orchestrator = createOrchestrator({
+    roundAuthority: cfg.roundAuthority,
+    onAuthorityAPI: cfg.onAuthorityAPI,
     manifest: cfg.manifest,
     platform: cfg.platform,
     cheatsEnabled,

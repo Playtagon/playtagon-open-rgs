@@ -3,6 +3,7 @@
 // math defined no autoclose(). These tests pin that the policy is honoured.
 
 import { describe, expect, test } from "bun:test";
+import * as sessions from "../src/session.js";
 import { createOrchestrator } from "../src/index.js";
 import {
   defineGame,
@@ -28,7 +29,8 @@ class SpyPlatform implements PlatformAdapter {
   closeCarries: (string | undefined)[] = [];
   closeMathVersions: (string | undefined)[] = [];
   async closeComplex(req: CloseComplex): Promise<RoundReceipt> { this.closeWins.push(req.win); this.closeReasons.push(req.reason); this.closeCarries.push(req.carry); this.closeMathVersions.push(req.mathVersion); this.balance += req.win; return { roundId: req.roundId, balance: this.balance }; }
-  onEvent(_h: (e: PlatformEvent) => void) {}
+  eventHandler: (e: PlatformEvent) => void = () => {};
+  onEvent(h: (e: PlatformEvent) => void) { this.eventHandler = h; }
 }
 
 // Complex math: optionally implements autoclose() returning a banked value.
@@ -125,5 +127,48 @@ describe("autoclose policy (H5)", () => {
     // Stamped with the math that produced it, the same as a client close, so
     // the RGS can tell a carry written by older math from one it can use.
     expect(platform.closeMathVersions).toEqual(["1"]);
+  });
+});
+
+
+describe("sessionClosed preserves unsettled rounds (Crash prerequisite)", () => {
+  const drain = () => new Promise<void>(resolve => setImmediate(resolve));
+
+  test("hold retains the exact open round after the session-close event", async () => {
+    const { orch, platform, conn } = setup("hold", true);
+    const sid = "closed-hold";
+    await orch.init({ sid }, conn);
+    const opened = await orch.openRound({ mode: "cx" }, conn);
+    platform.eventHandler({ type: "sessionClosed", sessionId: sid, reason: "expired" });
+    await drain();
+    expect(sessions.get(sid)?.openRound?.roundId).toBe(opened.roundId);
+    expect(platform.closeWins).toEqual([]);
+  });
+
+  test("wallet failure retains the round so a later reconciliation can pay", async () => {
+    const { orch, platform, conn } = setup("math-decides", true);
+    const sid = "closed-wallet-failure";
+    await orch.init({ sid }, conn);
+    const opened = await orch.openRound({ mode: "cx" }, conn);
+    const close = platform.closeComplex.bind(platform);
+    platform.closeComplex = async () => { throw new Error("wallet offline"); };
+    platform.eventHandler({ type: "sessionClosed", sessionId: sid, reason: "expired" });
+    await drain();
+    expect(sessions.get(sid)?.openRound?.roundId).toBe(opened.roundId);
+    platform.closeComplex = close;
+    const result = await orch.autocloseRound({ sessionId: sid, roundId: opened.roundId, reason: "reconcile" });
+    expect(result.closed).toBe(true);
+    expect(platform.closeWins).toEqual([500]);
+  });
+
+  test("confirmed settlement still releases the closed session", async () => {
+    const { orch, platform, conn } = setup("math-decides", true);
+    const sid = "closed-settled";
+    await orch.init({ sid }, conn);
+    await orch.openRound({ mode: "cx" }, conn);
+    platform.eventHandler({ type: "sessionClosed", sessionId: sid, reason: "expired" });
+    await drain();
+    expect(platform.closeWins).toEqual([500]);
+    expect(sessions.get(sid)).toBeUndefined();
   });
 });
