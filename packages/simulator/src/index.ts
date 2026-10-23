@@ -7,7 +7,8 @@ export { simulateNativeBatch, type NativeBatchOptions } from "./native-batch.js"
 export { mdReport, mdReportSet, type SimulationReport, type DistributionStats } from "./report.js";
 export { htmlReportSet, type HtmlReportOptions } from "./html.js";
 export { computeDeviations, narrate, type TargetDeviation, type DeviationStatus } from "./deviation.js";
-export { mulberry32 } from "./rng.js";
+export { mulberry32, xoshiro256ss, type SeededRng, type StatefulSimulatorRng } from "./rng.js";
+export { sampleMode, mergeSampleChunks, HISTOGRAM_EDGES, type SampleOptions, type SampleChunk, type SampleState } from "./sample.js";
 export {
   createFlowRecorder, flowToMermaid, flowToMarkovTable,
   type FlowGraph, type FlowEdge, type FlowContext, type FlowLabel,
