@@ -43,6 +43,8 @@ export interface OpenRound {
    *  (e.g. ante 1.25x on a 1-unit base = 1.25). Used for balance check,
    *  max-win cap, win calculation. */
   effectiveCost: number;
+  /** A checkpoint may have committed without an answer; init must read the wallet. */
+  checkpointUncertain?: boolean;
   state: RoundState;
   awaiting?: AwaitingHint;
   /** Action log for replay-on-reconnect. */

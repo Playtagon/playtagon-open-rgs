@@ -1,3 +1,4 @@
+import { roundedStakeCost } from '@open-rgs/contract';
 // Orchestrator: the heart of the RGS. Resolves modes, computes bets,
 // calls platform + math, threads carry, builds responses.
 //
@@ -326,6 +327,15 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
 
   // --- Helpers ------------------------------------------------------------
 
+  if (manifest.statePersistence === 'checkpointed' && (!platform.durableRoundState || typeof platform.updateComplex !== 'function')) {
+    throw new Error('checkpointed rounds require a durable CAS checkpoint wallet');
+  }
+  for (const [id, mode] of Object.entries(manifest.modes)) {
+    if (mode.costRounding && !platform.supportedCostRounding?.includes(mode.costRounding)) {
+      throw new Error(`mode '${id}' requires wallet cost rounding ${mode.costRounding}`);
+    }
+  }
+
   function modeOrThrow(modeId: string): GameMode {
     const m = manifest.modes[modeId];
     if (!m) throw new RGSError("INVALID_MODE", `Unknown mode '${modeId}'`);
@@ -359,7 +369,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
 
   function buildSpinContext(
     modeId: string,
-    bet: { betIndex: number; priceMultiplier: number },
+    bet: { betIndex: number; priceMultiplier: number; settlementPriceMultiplier?: number },
     cheatRaw?: Record<string, unknown>,
     params?: Record<string, unknown>,
   ): SpinContext {
@@ -370,7 +380,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     // betIndex/priceMultiplier come from computeBet, never straight off the
     // wire: they are the same numbers the wallet is charged against, so a
     // math reading them cannot be fed one stake and settled at another.
-    return { mode: modeId, betIndex: bet.betIndex, priceMultiplier: bet.priceMultiplier, cheat, params };
+    return { mode: modeId, betIndex: bet.betIndex, priceMultiplier: bet.priceMultiplier, ...(bet.settlementPriceMultiplier !== undefined ? { settlementPriceMultiplier: bet.settlementPriceMultiplier } : {}), cheat, params };
   }
 
   /** The one place a round is priced. Every money path reads its result:
@@ -390,7 +400,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     modeId: string,
     requestedBetIndex: number | undefined,
     requestedPriceMultiplier: number | undefined,
-  ): { bet: number; betIndex: number; clientPrice: number; priceMultiplier: number; effectiveCost: number; promoId?: string } {
+  ): { bet: number; betIndex: number; clientPrice: number; priceMultiplier: number; effectiveCost: number; settlementPriceMultiplier?: number; promoId?: string } {
     const promoOv = promo.activeOverride(s, modeId);
     if (promoOv) {
       const idx = s.allowedBets.indexOf(promoOv.bet);
@@ -398,7 +408,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       // Promo-overridden free rounds skip stake fold by definition.
       return {
         bet: promoOv.bet, betIndex: idx, clientPrice: 1, priceMultiplier: mode.stakeMultiplier,
-        effectiveCost: promoOv.bet, promoId: promoOv.promoId,
+        effectiveCost: promoOv.bet, promoId: promoOv.promoId, ...(mode.costRounding ? { settlementPriceMultiplier: 1 } : {}),
       };
     }
     const betIndex = requestedBetIndex ?? s.defaultBetIndex;
@@ -426,11 +436,15 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     // at full currency precision from (bet, priceMultiplier). Used for the
     // balance check, the max-win cap input and the win.
     const priceMultiplier = clientPrice * mode.stakeMultiplier;
-    const effectiveCost = bet * priceMultiplier;
+    let effectiveCost = bet * priceMultiplier;
+    if (mode.costRounding) {
+      try { effectiveCost = roundedStakeCost(bet, priceMultiplier); }
+      catch { throw new RGSError("INVALID_BET", "rounded round cost is not representable"); }
+    }
     if (!Number.isFinite(priceMultiplier) || !Number.isFinite(effectiveCost) || effectiveCost < 0) {
       throw new RGSError("INVALID_BET", `round cost is not representable: ${bet} x ${priceMultiplier}`);
     }
-    return { bet, betIndex, clientPrice, priceMultiplier, effectiveCost };
+    return { bet, betIndex, clientPrice, priceMultiplier, effectiveCost, ...(mode.costRounding ? { settlementPriceMultiplier: effectiveCost / bet } : {}) };
   }
 
   function modeCatalogForClient() {
@@ -485,7 +499,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     let s = sessions.get(req.sid);
     let info: import("@open-rgs/contract").SessionInfo;
 
-    if (s?.openRound) {
+    if (s?.openRound && !s.openRound.checkpointUncertain) {
       // Don't re-call openSession on the platform, we still own this
       // session locally and the platform still has the round open. Refresh
       // balance from the platform's last known value (BalanceChangedEvent
@@ -625,6 +639,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         roundId: s.openRound.roundId,
         modeId: s.openRound.modeId,
         bet: s.openRound.bet,
+        ...(manifest.modes[s.openRound.modeId]?.costRounding ? { cost: s.openRound.effectiveCost } : {}),
         ...(s.openRound.priceMultiplier !== undefined ? { priceMultiplier: s.openRound.priceMultiplier } : {}),
         ops: s.openRound.opsLog,
         actionLog: s.openRound.actionLog,
@@ -670,7 +685,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
    */
   function roundTerms(mode: GameMode, promoFunded: boolean, clientPrice: number): string {
     const cap = mode.maxWinMultiplier ?? manifest.maxWinMultiplier;
-    return `v2;stake=${promoFunded ? "promo" : mode.stakeMultiplier};cap=${cap ?? "none"};cp=${clientPrice}`;
+    return `${mode.costRounding || manifest.statePersistence ? `v3;round=${mode.costRounding ?? "exact"};state=${manifest.statePersistence ?? "volatile"}` : "v2"};stake=${promoFunded ? "promo" : mode.stakeMultiplier};cap=${cap ?? "none"};cp=${clientPrice}`;
   }
 
   function legacyTerms(mode: GameMode, promoFunded: boolean): string {
@@ -683,7 +698,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     mode: GameMode, r: WalletOpenRound,
   ): { priceMultiplier?: number; effectiveCost: number } | string {
     const promoFunded = Boolean(r.promoId);
-    if (r.terms !== undefined && r.terms === legacyTerms(mode, promoFunded)) {
+    if (!mode.costRounding && !manifest.statePersistence && r.terms !== undefined && r.terms === legacyTerms(mode, promoFunded)) {
       // v1: the opener sent bet = rung x clientPrice, so its cost was
       // bet x stake. Kept exactly, a restart must not reprice an old round.
       return { effectiveCost: promoFunded ? r.bet : r.bet * mode.stakeMultiplier };
@@ -698,7 +713,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     }
     if (promoFunded) return { priceMultiplier: mode.stakeMultiplier, effectiveCost: r.bet };
     const priceMultiplier = clientPrice * mode.stakeMultiplier;
-    return { priceMultiplier, effectiveCost: r.bet * priceMultiplier };
+    return { priceMultiplier, effectiveCost: mode.costRounding ? roundedStakeCost(r.bet, priceMultiplier) : r.bet * priceMultiplier };
   }
 
   /**
@@ -726,6 +741,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         "event.category": "orchestrator", "event.action": "resume_not_adopted",
         "session.id": sessionId, "round.id": r.roundId, "round.mode": r.modeId, reason,
       });
+      if (manifest.statePersistence === 'checkpointed') throw new RGSError('INIT_FAILED', `Cannot safely resume the open round: ${reason}`);
       return undefined;
     };
     const mode = manifest.modes[r.modeId];
@@ -741,7 +757,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         const view = await Promise.resolve(mode.math.resume(r.state));
         // Trust the MATH (not the wallet) about whether the outcome is already fixed.
         fixedAtOpen = isAwaitingEndRound(view.awaiting?.type);
-        if (ops.length === 0) {
+        if (ops.length === 0 || manifest.statePersistence === 'checkpointed') {
           ops = view.ops;
           awaiting = view.awaiting ?? awaiting;
         }
@@ -749,7 +765,9 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         return skip(`math could not rebuild the round: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
-    if (!fixedAtOpen) return skip("the round still awaits a decision; its persisted state may not be the last step");
+    if (!fixedAtOpen && !(manifest.statePersistence === 'checkpointed' && platform.durableRoundState && r.terms?.startsWith('v3;'))) {
+      return skip("the round still awaits a decision; its persisted state may not be the last step");
+    }
     const pricing = pricingFromTerms(mode, r);
     if (typeof pricing === "string") return skip(pricing);
     log.info("Open round adopted from the wallet", {
@@ -804,7 +822,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     // first-class wire field. Ignored entirely when cheatsEnabled is false.
     const ctx = buildSpinContext(
       requestedMode,
-      { betIndex: betInfo.betIndex, priceMultiplier: betInfo.priceMultiplier },
+      { betIndex: betInfo.betIndex, priceMultiplier: betInfo.priceMultiplier, settlementPriceMultiplier: betInfo.settlementPriceMultiplier },
       req.params?.["cheat"] as Record<string, unknown> | undefined,
       req.params,
     );
@@ -850,6 +868,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         bet: betInfo.bet,
         betIndex: betInfo.betIndex,
         priceMultiplier: betInfo.priceMultiplier,
+        ...(mode.costRounding ? { costRounding: mode.costRounding } : {}),
         win,
         multiplier: cappedOutcome.multiplier,
         type: cappedOutcome.type,
@@ -900,6 +919,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       balance: receipt.balance,
       bet: betInfo.bet,
       priceMultiplier: betInfo.priceMultiplier,
+      ...(mode.costRounding ? { cost: betInfo.effectiveCost } : {}),
       win,
       multiplier: cappedOutcome.multiplier,
       type: cappedOutcome.type,
@@ -944,7 +964,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     // most needed, because everything after it is a branch.
     const ctx = buildSpinContext(
       requestedMode,
-      { betIndex: betInfo.betIndex, priceMultiplier: betInfo.priceMultiplier },
+      { betIndex: betInfo.betIndex, priceMultiplier: betInfo.priceMultiplier, settlementPriceMultiplier: betInfo.settlementPriceMultiplier },
       req.params?.["cheat"] as Record<string, unknown> | undefined,
       req.params,
     );
@@ -960,6 +980,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         bet: betInfo.bet,
         betIndex: betInfo.betIndex,
         priceMultiplier: betInfo.priceMultiplier,
+        ...(mode.costRounding ? { costRounding: mode.costRounding } : {}),
         modeId: requestedMode,
         initialState: open.state,
         ...(mode.math.version ? { mathVersion: mode.math.version } : {}),
@@ -1009,6 +1030,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       balance: receipt.balance,
       bet: betInfo.bet,
       priceMultiplier: betInfo.priceMultiplier,
+      ...(mode.costRounding ? { cost: betInfo.effectiveCost } : {}),
       awaiting: open.awaiting,
     };
   }
@@ -1018,6 +1040,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
   async function stepRound(req: ClientRequestStepRound, conn: ConnectionMeta): Promise<ClientResponseStepRound> {
     const s = sessionOrThrow(req.sid ?? conn.sessionId);
     const open = s.openRound;
+    if (open?.checkpointUncertain) throw new RGSError('STEP_FAILED', 'Checkpoint result is unknown; reconnect to restore the round');
     if (!open) throw new RGSError("NO_ROUND_OPEN", "No round in progress");
 
     if (open.awaiting && open.awaiting.type !== req.action.type) {
@@ -1036,6 +1059,16 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       throw translate(e, "STEP_FAILED");
     }
 
+    if (manifest.statePersistence === 'checkpointed') {
+      try {
+        await timedPlatformCall(metrics, 'updateComplex', () => platform.updateComplex!({
+          sessionId: s.sessionId, roundId: open.roundId, state: stepResult.state, previousState: open.state,
+        }));
+      } catch (e) {
+        open.checkpointUncertain = true;
+        throw translate(e, 'STEP_FAILED');
+      }
+    }
     open.state = stepResult.state;
     if (stepResult.awaiting) open.awaiting = stepResult.awaiting;
     else delete open.awaiting;
@@ -1050,7 +1083,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     });
 
     // Wallet-side action-log checkpoint, if the provider supports it.
-    if (typeof platform.updateComplex === "function") {
+    if (manifest.statePersistence !== 'checkpointed' && typeof platform.updateComplex === "function") {
       const update = () => timedPlatformCall(metrics, "updateComplex", () => platform.updateComplex!({
         sessionId: s.sessionId,
         roundId: open.roundId,
@@ -1083,6 +1116,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     const recovered = await recoverSettledClose(s, req);
     if (recovered) return recovered;
     const open = s.openRound;
+    if (open?.checkpointUncertain) throw new RGSError('STEP_FAILED', 'Checkpoint result is unknown; reconnect to restore the round');
     if (!open) throw new RGSError("NO_ROUND_OPEN", "No round in progress");
 
     const mode = modeOrThrow(open.modeId);
@@ -1116,6 +1150,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         sessionId: s.sessionId,
         roundId: open.roundId,
         finalState: open.state,
+        ...(manifest.statePersistence === 'checkpointed' ? { expectedState: open.state } : {}),
         win,
         multiplier: cappedClose.multiplier,
         type: cappedClose.type,
@@ -1277,6 +1312,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     if (!s) return { closed: false, reason: "session-not-found" };
 
     const open = s.openRound;
+    if (open?.checkpointUncertain) return { closed: false, reason: 'checkpoint-uncertain' };
     if (!open) return { closed: false, reason: "no-round-open" };
 
     if (req.roundId && req.roundId !== open.roundId) {
@@ -1350,6 +1386,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         sessionId: s.sessionId,
         roundId: open.roundId,
         finalState: open.state,
+        ...(manifest.statePersistence === 'checkpointed' ? { expectedState: open.state } : {}),
         win,
         multiplier: cappedClose.multiplier,
         type: cappedClose.type,
