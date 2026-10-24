@@ -466,7 +466,9 @@ async function simulateMode(
   return report;
 }
 
-function pickAction(
+/** Choose a complex-round action. Shared with the release sampler, which
+ *  passes its own full-state generator as `rng`. */
+export function pickAction(
   awaiting: AwaitingHint,
   ops: Op[],
   step: number,
