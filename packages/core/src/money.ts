@@ -54,3 +54,15 @@ export function assertSafeAmount(n: number, name: string): void {
     );
   }
 }
+
+
+/** Exact floor boundary for opted-in authority math. No float product. */
+export function settleFloorE8(multiplierE8: string, bet: number): number {
+  assertSafeAmount(bet, "bet");
+  if (typeof multiplierE8 !== "string" || !/^(0|[1-9][0-9]{0,23})$/.test(multiplierE8)) {
+    throw new RGSError("INTERNAL_ERROR", "Invalid exact E8 multiplier");
+  }
+  const win = BigInt(multiplierE8) * BigInt(bet) / 100_000_000n;
+  if (win > BigInt(Number.MAX_SAFE_INTEGER)) throw new RGSError("INTERNAL_ERROR", "Exact win exceeds safe money range");
+  return Number(win);
+}
