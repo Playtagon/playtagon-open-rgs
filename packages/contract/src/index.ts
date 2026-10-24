@@ -99,6 +99,10 @@ export interface StepOutcome {
 
 /** What a complex-round math returns from close(). */
 export interface CloseOutcome {
+  /** Exact scaled multiplier for an opted-in floor-e8 mode; decimal integer string. */
+  multiplierE8?: string;
+  /** Public-safe checkpoint of the resolved round, never the private decision. */
+  finalState?: RoundState;
   multiplier: number;
   ops: Op[];
   type: string;
@@ -107,6 +111,63 @@ export interface CloseOutcome {
 }
 
 // --- Round inputs -----------------------------------------------------------
+
+/** Private server authority context. Never part of a client request. */
+export interface AuthorityOpenContext {
+  authorityId: string;
+  bindingId: string;
+  bindingHash: string;
+  roomId: string;
+  roomRoundId: string;
+  slot: 0 | 1;
+  rulesVersion: string;
+  curveHash: string;
+  serverSeedCommit: string;
+  epochSaltRef: string;
+  drawCommit: string;
+  autoCashout100?: string;
+  forcedCap100: string;
+}
+
+/** Private immutable decision; decimal strings represent integer quantities. */
+export interface AuthorityResolutionContext {
+  authorityId: string;
+  bindingHash: string;
+  decisionId: string;
+  decisionHash: string;
+  roomRoundId: string;
+  kind: "manual_cashout" | "auto_cashout" | "forced_cap" | "room_budget_cap" | "crash_loss" | "cancelled" | "interrupted_refund";
+  effectiveElapsedUs: string;
+  target100?: string;
+  budgetTargetE8?: string;
+  draw52?: string;
+  rulesVersion: string;
+  curveHash: string;
+  terminalReason?: string;
+}
+
+/** Host owns durability, fencing, due-time checks and immutable binding/decision validation. */
+export interface RoundAuthority {
+  resolveOpen(input: {
+    authorityId: string; bindingId: string; internalSid: string; modeId: string;
+    bet: number; betIndex: number; priceMultiplier: number; operationKey: string;
+  }): Promise<AuthorityOpenContext>;
+  resolveDecision(input: {
+    authorityId: string; internalSid: string; rgsRoundId: string;
+    state: RoundState; decisionId?: string;
+  }): Promise<AuthorityResolutionContext | null>;
+  authorizeRestore(input: {
+    authorityId: string; internalSid: string; checkpoint: WalletOpenRound;
+  }): Promise<boolean>;
+}
+
+/** Passed only to the embedding host, never registered with ClientTransport. */
+export interface OrchestratorAuthorityAPI {
+  openBoundRound(input: { internalSid: string; modeId: string; ladderIndex: number; bindingId: string; openKey: string }): Promise<ClientResponseOpenRound>;
+  closeDecidedRound(input: { internalSid: string; rgsRoundId: string; decisionId: string }): Promise<ClientResponseCloseRound>;
+  autocloseDecidedRound(input: { internalSid: string; rgsRoundId: string; decisionId: string }): Promise<ClientResponseCloseRound>;
+  restoreBoundRound(input: { internalSid: string; rgsRoundId: string }): Promise<void>;
+}
 
 /** Per-spin context the wrapper hands math. Currency-blind. */
 /** Explicit opt-in only. Existing exact-price modes keep their contract. */
@@ -130,6 +191,7 @@ export function roundedStakeCost(bet: number, priceMultiplier: number): number {
 }
 
 export interface SpinContext {
+  authority?: AuthorityOpenContext;
   /** Mode id resolved by the wrapper (after promo override / nextMode override). */
   mode: string;
   /** Index into the session's bet ladder for THIS round, as the orchestrator
@@ -291,6 +353,8 @@ export interface SimpleMath {
 /** Complex-round math: open -> step* -> close. Carry threads across rounds.
  *  Same currency-blindness as SimpleMath. */
 export interface ComplexMath {
+  /** Opt in only when terminal/close/autoclose/resume support private authority contexts. */
+  readonly authorityVersion?: 1;
   readonly kind: "complex";
   readonly name: string;
   readonly version: string;
@@ -302,11 +366,11 @@ export interface ComplexMath {
 
   open(prev: CarryState | undefined, ctx: SpinContext): OpenOutcome | Promise<OpenOutcome>;
   step(state: RoundState, action: PlayerAction): StepOutcome | Promise<StepOutcome>;
-  isTerminal(state: RoundState): boolean | Promise<boolean>;
-  close(state: RoundState): CloseOutcome | Promise<CloseOutcome>;
+  isTerminal(state: RoundState, authority?: AuthorityResolutionContext): boolean | Promise<boolean>;
+  close(state: RoundState, authority?: AuthorityResolutionContext): CloseOutcome | Promise<CloseOutcome>;
 
   /** Optional autoclose resolver: produce a close outcome from current state. */
-  autoclose?(state: RoundState): CloseOutcome | Promise<CloseOutcome>;
+  autoclose?(state: RoundState, authority?: AuthorityResolutionContext): CloseOutcome | Promise<CloseOutcome>;
 
   /** Optional (ADR-007): rebuild the render ops and the `awaiting` hint of an
    *  open round from its state, for a resume on a process that did not open
@@ -325,6 +389,10 @@ export type MathModule = SimpleMath | ComplexMath;
 // --- Game manifest ----------------------------------------------------------
 
 export interface GameMode {
+  /** Existing games default to half-even; floor-e8 is for authority complex math only. */
+  moneyRounding?: "half-even" | "floor-e8";
+  resolutionAuthority?: string;
+  recoveryMode?: "fixed-at-open" | "external-authority";
   /** Math implementation backing this mode. */
   math: MathModule;
   /** Bet stake-multiplier (base = 1, feature buys typically 10-100). */
@@ -1123,6 +1191,8 @@ export type ConcurrencyPolicy = "kick-old" | "reject-new" | "allow";
 // --- Canonical error vocabulary ---------------------------------------------
 
 export type RGSErrorCode =
+  | "AUTHORITY_REQUIRED"
+  | "AUTHORITY_NOT_READY"
   | "INVALID_FORMAT"
   | "DECODE_ERROR"
   | "MISSING_SESSION"
