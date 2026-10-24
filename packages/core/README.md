@@ -176,3 +176,30 @@ The contracts and guarantees this package enforces:
 ## License
 
 MIT.
+
+### Explicit rounded prices and native checkpoints (Playtagon fork)
+
+A mode may opt into `costRounding: "half-up"`. Its nominal `priceMultiplier`
+remains server-controlled; the debit is `roundedStakeCost(bet, priceMultiplier)`.
+The wallet must advertise `supportedCostRounding` and independently validate the
+served mode policy. Otherwise the orchestrator refuses to start. Rounded costs
+must be positive safe integers. Existing modes retain their original pricing.
+
+For such a mode, math receives `ctx.settlementPriceMultiplier = chargedCost / bet`.
+A game expressing payouts relative to the base bet divides its base-bet multiplier
+by this value. The engine then multiplies by the integer charged cost exactly once.
+OPEN/resume expose that cost; balance checks and win caps use it too. This is an
+opt-in API change, not permission to round arbitrary legacy wallet debits.
+
+Native interactive games may opt into `statePersistence: "checkpointed"` in their
+manifest. They require a wallet advertising `durableRoundState` with durable OPEN,
+CAS `updateComplex({previousState, state})`, and `closeComplex({expectedState})`.
+Every step checkpoint completes before its ops are acknowledged. A failed or
+ambiguous checkpoint blocks STEP/CLOSE until INIT reads the wallet's authoritative
+state. Recovery requires matching v3 terms and a public math `resume` view; older
+volatile checkpoints are never upgraded by assumption. Default/deferred rounds
+retain their existing terms and behaviour.
+
+Upstream proposal: review these two explicit opt-ins independently of platform
+integration; tests cover unsupported adapters, integer debit/cap/idempotency,
+process adoption, commit-then-timeout, stale CAS and legacy-term rejection.
