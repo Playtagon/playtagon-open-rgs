@@ -1,3 +1,4 @@
+import { roundedStakeCost, type CostRounding } from "@open-rgs/contract";
 // @open-rgs/platform-mock
 //
 // In-memory PlatformAdapter for development and testing. Holds balances per
@@ -92,9 +93,9 @@ function assertAmount(n: number, name: string): void {
 /** The round's debit: bet (the ladder rung) x priceMultiplier (client price x
  *  mode stake), Spec 05 "Round price". A price that cannot produce a finite,
  *  non-negative cost is refused before anything moves. */
-function roundCost(bet: number, priceMultiplier: number | undefined): number {
+function roundCost(bet: number, priceMultiplier: number | undefined, rounding?: CostRounding): number {
   const p = priceMultiplier ?? 1;
-  const cost = bet * p;
+  const cost = rounding === "half-up" ? roundedStakeCost(bet, p) : bet * p;
   if (typeof p !== "number" || !Number.isFinite(p) || p < 0 || !Number.isFinite(cost)) {
     throw new Error(`InvalidAmount: priceMultiplier must be a finite non-negative number, got ${String(priceMultiplier)}`);
   }
@@ -102,6 +103,7 @@ function roundCost(bet: number, priceMultiplier: number | undefined): number {
 }
 
 export class MockPlatform implements PlatformAdapter {
+  readonly supportedCostRounding = ["half-up"] as const;
   private state = new Map<string, MockState>();
   private handlers: ((e: PlatformEvent) => void)[] = [];
   /** idempotencyKey -> the receipt produced the first time we saw it. A
@@ -191,7 +193,7 @@ export class MockPlatform implements PlatformAdapter {
       // `priceMultiplier`. A wallet with its own currency-precision handling
       // recomputes the debit; our mock does the same so ante-style fractional
       // debits + free-round (stake=0) modes both settle correctly.
-      const cost = roundCost(req.bet, req.priceMultiplier);
+      const cost = roundCost(req.bet, req.priceMultiplier, req.costRounding);
       if (cost > s.balance) throw new Error("InsufficientFunds");
       s.balance -= cost;
     }
@@ -226,7 +228,7 @@ export class MockPlatform implements PlatformAdapter {
       this.assertPromo(s, req.promoId!);
     } else {
       // See settleSimple: debit = bet x priceMultiplier.
-      const cost = roundCost(req.bet, req.priceMultiplier);
+      const cost = roundCost(req.bet, req.priceMultiplier, req.costRounding);
       if (cost > s.balance) throw new Error("InsufficientFunds");
       s.balance -= cost;
     }
