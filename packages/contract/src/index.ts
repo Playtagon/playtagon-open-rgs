@@ -109,6 +109,26 @@ export interface CloseOutcome {
 // --- Round inputs -----------------------------------------------------------
 
 /** Per-spin context the wrapper hands math. Currency-blind. */
+/** Explicit opt-in only. Existing exact-price modes keep their contract. */
+export type CostRounding = "half-up";
+
+/** Integer stake cost for modes whose nominal price is not representable in minor units. */
+export function roundedStakeCost(bet: number, priceMultiplier: number): number {
+  if (!Number.isSafeInteger(bet) || bet <= 0 || !Number.isFinite(priceMultiplier) || priceMultiplier <= 0) {
+    throw new Error("InvalidAmount: rounded stake cost needs a positive integer bet and finite price");
+  }
+  // Price means its declared decimal, not a binary product just below an exact tie
+  // (100 × 1.005 must cost 101, not 100). Also handle finite exponent notation.
+  const parts = /^(\d+)(?:\.(\d+))?(?:e([+-]?\d+))?$/.exec(String(priceMultiplier))!;
+  const fraction = parts[2] ?? '';
+  const exponent = Number(parts[3] ?? 0) - fraction.length;
+  const numerator = BigInt(bet) * BigInt(parts[1]! + fraction) * 10n ** BigInt(Math.max(0, exponent));
+  const denominator = 10n ** BigInt(Math.max(0, -exponent));
+  const cost = (numerator + denominator / 2n) / denominator;
+  if (cost <= 0n || cost > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("InvalidAmount: rounded stake cost must be a positive safe integer");
+  return Number(cost);
+}
+
 export interface SpinContext {
   /** Mode id resolved by the wrapper (after promo override / nextMode override). */
   mode: string;
@@ -134,6 +154,10 @@ export interface SpinContext {
    *  number of chips for a multi-chip table round on a stake-1 mode. Same
    *  server-authoritative guarantee as {@link betIndex}. */
   priceMultiplier?: number;
+  /** Actual charged cost / base bet, for an explicitly rounded-price mode.
+   * Currency-blind; use this denominator when normalizing a base-bet payout.
+   * Absent for existing modes (use priceMultiplier). Never client-supplied. */
+  settlementPriceMultiplier?: number;
   /** Dev-only forced-outcome hint. Populated by the orchestrator ONLY when
    *  cheats are explicitly enabled (createServer `enableCheats` /
    *  `OPEN_RGS_ENABLE_CHEATS=1`) AND not in production, it is always
@@ -305,6 +329,8 @@ export interface GameMode {
   math: MathModule;
   /** Bet stake-multiplier (base = 1, feature buys typically 10-100). */
   stakeMultiplier: number;
+  /** Explicit integer debit rounding; requires wallet support. Absent = existing exact pricing. */
+  costRounding?: CostRounding;
   /** Human-readable label surfaced to the client. */
   label?: string;
   /** True = mode cannot be requested by the client directly; only routed
@@ -337,6 +363,9 @@ export interface RecoveryPolicy {
 }
 
 export interface GameManifest {
+  /** Native interactive recovery: every step is CAS-checkpointed before acknowledgement.
+   * Requires PlatformAdapter.durableRoundState. Absent = existing behaviour. */
+  statePersistence?: 'checkpointed';
   id: string;
   declaredRtp: number;
   modes: Record<string, GameMode>;
@@ -351,6 +380,7 @@ export interface GameManifest {
 
 /** Identity helper: validates and freezes the manifest. */
 export function defineGame(m: GameManifest): GameManifest {
+  if (m.statePersistence !== undefined && m.statePersistence !== 'checkpointed') throw new Error('invalid statePersistence');
   if (!m.id) throw new Error("GameManifest.id required");
   if (!m.modes || Object.keys(m.modes).length === 0) {
     throw new Error("GameManifest.modes must be non-empty");
@@ -372,6 +402,7 @@ export function defineGame(m: GameManifest): GameManifest {
     throw new Error(`GameManifest.maxWinMultiplier must be a positive finite number, got ${m.maxWinMultiplier}`);
   }
   for (const [id, mode] of Object.entries(m.modes)) {
+    if (mode.costRounding !== undefined && mode.costRounding !== "half-up") throw new Error(`mode '${id}' has invalid costRounding`);
     if (typeof mode.stakeMultiplier !== "number" || !Number.isFinite(mode.stakeMultiplier) || mode.stakeMultiplier < 0) {
       throw new Error(`mode '${id}' has invalid stakeMultiplier`);
     }
@@ -504,6 +535,8 @@ export interface PromoFreeRounds {
  *  rebuild visual state, then renders a UI for awaiting. */
 export interface OpenRoundResume {
   roundId: string;
+  /** Actual integer debit for a rounded-price mode; priceMultiplier remains nominal. */
+  cost?: number;
   modeId: string;
   /** The ladder rung the round was priced on (see {@link SettleSimple.bet}). */
   bet: number;
@@ -589,6 +622,8 @@ export interface SettleSimple {
   /** Full price multiplier: client priceMultiplier x mode stakeMultiplier.
    *  May be fractional (ante 1.25). */
   priceMultiplier: number;
+  /** Server mode policy, never read from client params. */
+  costRounding?: CostRounding;
   /** Win in the currency's minimal unit (integer). */
   win: number;
   /** Dimensionless win multiplier from math. */
@@ -616,6 +651,8 @@ export interface OpenComplex {
   betIndex: number;
   /** Full price multiplier; see {@link SettleSimple.priceMultiplier}. */
   priceMultiplier: number;
+  /** Server mode policy, never read from client params. */
+  costRounding?: CostRounding;
   /** The mode the round is opened in. Spec 05 asks the wallet to persist it
    *  so a resume on another process knows which math settles the round. */
   modeId?: string;
@@ -637,6 +674,8 @@ export interface UpdateComplex {
   sessionId: string;
   roundId: string;
   state: RoundState;
+  /** Compare-and-swap guard for acknowledged native-complex checkpoints. */
+  previousState?: RoundState;
 }
 
 export interface CloseComplex {
@@ -645,6 +684,8 @@ export interface CloseComplex {
   /** Math's final state for this round, opaque, persisted as the wallet's
    *  audit-grade round_state. */
   finalState: RoundState;
+  /** Refuse credit if the durable checkpoint no longer matches this state. */
+  expectedState?: RoundState;
   /** Cross-round carry math wants threaded into the NEXT round.
    *  Different from finalState (which is THIS round's state).
    *  Adapter persists for return on next openSession.carry. */
@@ -778,6 +819,10 @@ export type PlatformEvent =
   | { type: "autocloseRequested"; sessionId: string; roundId?: string; reason: string };
 
 export interface PlatformAdapter {
+  /** Fail-closed capability: rounded-price modes cannot boot on an older adapter. */
+  readonly supportedCostRounding?: readonly CostRounding[];
+  /** openSession returns the latest committed state; updateComplex supports previousState CAS. */
+  readonly durableRoundState?: boolean;
   connect(): Promise<void>;
   disconnect(): void;
 
@@ -907,6 +952,8 @@ export interface ClientResponseInit {
 
 export interface ClientResponseSpin {
   roundId: string;
+  /** Actual integer debit for a rounded-price mode; priceMultiplier remains nominal. */
+  cost?: number;
   ops: Op[];
   balance: number;
   /** The ladder rung, allowedBets[betIndex]. The round cost is
@@ -927,6 +974,8 @@ export interface ClientResponseSpin {
 
 export interface ClientResponseOpenRound {
   roundId: string;
+  /** Actual integer debit for a rounded-price mode; priceMultiplier remains nominal. */
+  cost?: number;
   ops: Op[];
   balance: number;
   /** The ladder rung; the round cost is bet x priceMultiplier. */
